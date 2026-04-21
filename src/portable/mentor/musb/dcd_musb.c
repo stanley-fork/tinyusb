@@ -191,21 +191,12 @@ static void process_setup_packet(uint8_t rhport) {
   }
 }
 
-static bool handle_xfer_in(uint8_t rhport, uint_fast8_t ep_addr) {
-  unsigned epnum = tu_edpt_number(ep_addr);
-  unsigned epnum_minus1 = epnum - 1;
-  pipe_state_t  *pipe = &_dcd.pipe[tu_edpt_dir(ep_addr)][epnum_minus1];
-  const unsigned rem  = pipe->remaining;
-
-  if (rem == 0 && pipe->length > 0) {
-    pipe->buf = NULL;
-    pipe->armed = false;
-    return true;
-  }
-
-  musb_regs_t* musb_regs = MUSB_REGS(rhport);
+// write to txfifo using pipe_state_t info
+static void pipe_write(musb_regs_t* musb_regs, uint8_t epnum) {
+  pipe_state_t* pipe = &_dcd.pipe[TUSB_DIR_IN][epnum - 1];
   musb_ep_csr_t* ep_csr = get_ep_csr(musb_regs, epnum);
   const unsigned mps = ep_csr->tx_maxp;
+  const unsigned rem = pipe->remaining;
   const unsigned len = TU_MIN(mps, rem);
   volatile void *fifo_ptr = &musb_regs->fifo[epnum];
   if (len) {
@@ -218,7 +209,19 @@ static bool handle_xfer_in(uint8_t rhport, uint_fast8_t ep_addr) {
     pipe->remaining = rem - len;
   }
   ep_csr->tx_csrl = MUSB_TXCSRL1_TXRDY;
-  // TU_LOG1(" TXCSRL%d = %x %d\r\n", epnum, ep_csr->tx_csrl, rem - len);
+}
+
+// Called from the TX interrupt. If the last queued packet finished the transfer,
+// signal completion; otherwise queue the next packet.
+static bool handle_xfer_in(musb_regs_t* musb_regs, uint8_t epnum) {
+  pipe_state_t* pipe = &_dcd.pipe[TUSB_DIR_IN][epnum - 1];
+
+  if (pipe->remaining == 0) {
+    pipe->buf = NULL;
+    pipe->armed = false;
+    return true;
+  }
+  pipe_write(musb_regs, epnum);
   return false;
 }
 
@@ -288,7 +291,7 @@ static bool edpt_n_xfer(uint8_t rhport, uint8_t ep_addr, void *buffer, uint16_t 
   pipe->armed        = true;
 
   if (dir_in) {
-    handle_xfer_in(rhport, ep_addr);
+    pipe_write(MUSB_REGS(rhport), (uint8_t) epnum);
   } else {
     musb_regs_t* musb_regs = MUSB_REGS(rhport);
     musb_ep_csr_t* ep_csr = get_ep_csr(musb_regs, epnum);
@@ -476,7 +479,7 @@ static void process_edpt_n(uint8_t rhport, uint_fast8_t ep_addr)
       ep_csr->tx_csrl &= ~(MUSB_TXCSRL1_STALLED | MUSB_TXCSRL1_UNDRN);
       return;
     }
-    completed = handle_xfer_in(rhport, ep_addr);
+    completed = handle_xfer_in(musb_regs, (uint8_t) epn);
   } else {
     // TU_LOG1(" RX CSRL%d = %x\r\n", epn, ep_csr->rx_csrl);
     if (ep_csr->rx_csrl & MUSB_RXCSRL1_STALLED) {

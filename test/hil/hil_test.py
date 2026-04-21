@@ -59,6 +59,7 @@ STATUS_SKIPPED = "\033[33mSkipped\033[0m"
 verbose = False
 test_only = []
 build_dir = 'cmake-build'
+skip_flash = False
 
 WCH_RISCV_CONTENT = """
 adapter driver wlinke
@@ -1248,11 +1249,15 @@ def test_example(board, f1, example):
     if verbose:
         print(f'Flashing {fw_name}.elf')
 
-    # flash firmware. It may fail randomly, retry a few times
+    # flash firmware (unless --skip-flash), then run the test. Both may fail randomly,
+    # retry a few times.
     start_s = time.time()
+    flash_ok = True
     for i in range(max_retry):
-        ret = globals()[f'flash_{board["flasher"]["name"].lower()}'](board, fw_name)
-        if ret.returncode == 0:
+        if not skip_flash:
+            ret = globals()[f'flash_{board["flasher"]["name"].lower()}'](board, fw_name)
+            flash_ok = (ret.returncode == 0)
+        if flash_ok:
             try:
                 tret = globals()[f'test_{example.replace("/", "_")}'](board)
                 if tret == 'skipped':
@@ -1271,7 +1276,7 @@ def test_example(board, f1, example):
             print(f'\n  Flash failed, retry {i+2}/{max_retry}', end='')
             time.sleep(0.5)
 
-    if ret.returncode != 0:
+    if not flash_ok:
         err_count += 1
         print(f'  Flash {STATUS_FAILED}', end='')
 
@@ -1315,8 +1320,9 @@ def test_board(board):
         for test in test_list:
             err_count += test_example(board, f1, test)
 
-    # flash board_test last to disable board's usb
-    test_example(board, flags_on_list[0], 'device/board_test')
+    # flash board_test last to disable board's usb (skipped when --skip-flash is set)
+    if not skip_flash:
+        test_example(board, flags_on_list[0], 'device/board_test')
 
     return name, err_count
 
@@ -1329,26 +1335,29 @@ def main():
     global test_only
     global build_dir
     global max_retry
+    global skip_flash
 
     duration = time.time()
 
     parser = argparse.ArgumentParser()
     parser.add_argument('config_file', help='Configuration JSON file')
     parser.add_argument('-b', '--board', action='append', default=[], help='Boards to test, all if not specified')
-    parser.add_argument('-s', '--skip', action='append', default=[], help='Skip boards from test')
+    parser.add_argument('-s', '--skip-board', action='append', default=[], help='Skip boards from test')
+    parser.add_argument('-sf', '--skip-flash', action='store_true', help='Run tests without flashing firmware (use whatever is already on the board)')
     parser.add_argument('-t', '--test-only', action='append', default=[], help='Tests to run, all if not specified')
-    parser.add_argument('-B', '--build', default='cmake-build', help='Build folder name (default: cmake-build)')
+    parser.add_argument('-B', '--build-dir', default='cmake-build', help='Build folder name (default: cmake-build)')
     parser.add_argument('-r', '--retry', type=int, default=3, help='Retry count for failed tests (default: 3)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     args = parser.parse_args()
 
     config_file = args.config_file
     boards = args.board
-    skip_boards = args.skip
+    skip_boards = args.skip_board
     verbose = args.verbose
     test_only = args.test_only
-    build_dir = args.build
+    build_dir = args.build_dir
     max_retry = args.retry
+    skip_flash = args.skip_flash
 
     # if config file is not found, try to find it in the same directory as this script
     if not os.path.exists(config_file):
@@ -1370,7 +1379,7 @@ def main():
         if err_count > 0:
             skip_boards += [name for name, err in mret if err == 0]
             with open(skip_fname, 'w') as f:
-                f.write(' '.join(f'-s {i}' for i in skip_boards))
+                f.write(' '.join(f'--skip-board {i}' for i in skip_boards))
         elif os.path.exists(skip_fname):
             os.remove(skip_fname)
 
