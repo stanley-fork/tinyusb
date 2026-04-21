@@ -69,6 +69,19 @@ typedef struct {
   bool      use_fifo;  /* true: buf is tu_fifo_t*; false: buf is plain byte pointer. */
 } pipe_state_t;
 
+// Pipe array layout (N = TUP_DCD_ENDPOINT_MAX):
+//   [0] : EP0 (shared between IN/OUT control stages)
+// One-direction-only IPs (CFG_TUD_ENDPOINT_ONE_DIRECTION_ONLY=1):
+//   [1 .. n-1] : EP1..n-1 (single slot per endpoint)
+// Bidirectional-capable IPs:
+//   [1 .. N-1  ] : EP OUT
+//   [N .. 2*N-2] : EP IN
+#if CFG_TUD_ENDPOINT_ONE_DIRECTION_ONLY
+  #define MUSB_PIPE_COUNT TUP_DCD_ENDPOINT_MAX
+#else
+  #define MUSB_PIPE_COUNT (2u * TUP_DCD_ENDPOINT_MAX - 1u)
+#endif
+
 typedef struct {
   union {
     tusb_control_request_t setup_packet;
@@ -76,11 +89,26 @@ typedef struct {
   };
   uint16_t     remaining_ctrl; /* The number of bytes remaining in data stage of control transfer. */
   int8_t       status_out;
-  pipe_state_t pipe0;
-  pipe_state_t pipe[2][TUP_DCD_ENDPOINT_MAX-1];   /* pipe[direction][endpoint number - 1] */
+  pipe_state_t pipe[MUSB_PIPE_COUNT];
 } dcd_data_t;
 
 static dcd_data_t _dcd;
+
+TU_ATTR_ALWAYS_INLINE static inline pipe_state_t* pipe_get(uint8_t epnum, tusb_dir_t epdir) {
+#if CFG_TUD_ENDPOINT_ONE_DIRECTION_ONLY
+  (void) epdir;
+  return &_dcd.pipe[epnum];
+#else
+  if (epnum == 0) {
+    return &_dcd.pipe[0];
+  }
+  size_t idx = epnum;
+  if (epdir == TUSB_DIR_IN) {
+    idx += TUP_DCD_ENDPOINT_MAX - 1u;
+  }
+  return &_dcd.pipe[idx];
+#endif
+}
 
 //--------------------------------------------------------------------
 // HW FIFO Helper
@@ -176,9 +204,10 @@ static void process_setup_packet(uint8_t rhport) {
   _dcd.setup_buffer[0] = musb_regs->fifo[0];
   _dcd.setup_buffer[1] = musb_regs->fifo[0];
 
-  _dcd.pipe0.buf       = NULL;
-  _dcd.pipe0.length    = 0;
-  _dcd.pipe0.remaining = 0;
+  pipe_state_t* pipe0 = pipe_get(0, TUSB_DIR_OUT);
+  pipe0->buf       = NULL;
+  pipe0->length    = 0;
+  pipe0->remaining = 0;
   dcd_event_setup_received(rhport, (const uint8_t*)(uintptr_t)&_dcd.setup_packet, true);
 
   const unsigned len    = _dcd.setup_packet.wLength;
@@ -193,7 +222,7 @@ static void process_setup_packet(uint8_t rhport) {
 
 // write to txfifo using pipe_state_t info
 static void pipe_write(musb_regs_t* musb_regs, uint8_t epnum) {
-  pipe_state_t* pipe = &_dcd.pipe[TUSB_DIR_IN][epnum - 1];
+  pipe_state_t* pipe = pipe_get(epnum, TUSB_DIR_IN);
   musb_ep_csr_t* ep_csr = get_ep_csr(musb_regs, epnum);
   const unsigned mps = ep_csr->tx_maxp;
   const unsigned rem = pipe->remaining;
@@ -213,31 +242,37 @@ static void pipe_write(musb_regs_t* musb_regs, uint8_t epnum) {
 
 // Called from the TX interrupt. If the last queued packet finished the transfer,
 // signal completion; otherwise queue the next packet.
-static bool handle_xfer_in(musb_regs_t* musb_regs, uint8_t epnum) {
-  pipe_state_t* pipe = &_dcd.pipe[TUSB_DIR_IN][epnum - 1];
+static void process_epin(uint8_t rhport, musb_regs_t *musb_regs, uint8_t epnum) {
+  musb_ep_csr_t* ep_csr = get_ep_csr(musb_regs, epnum);
+  if (ep_csr->tx_csrl & MUSB_TXCSRL1_STALLED) {
+    ep_csr->tx_csrl &= ~(MUSB_TXCSRL1_STALLED | MUSB_TXCSRL1_UNDRN);
+    return; // sent STALL, do nothing
+  }
 
+  pipe_state_t* pipe = pipe_get(epnum, TUSB_DIR_IN);
   if (pipe->remaining == 0) {
+    const uint16_t xferred_len = pipe->length;
     pipe->buf = NULL;
     pipe->armed = false;
-    return true;
+    dcd_event_xfer_complete(rhport, tu_edpt_addr(epnum, TUSB_DIR_IN), xferred_len, XFER_RESULT_SUCCESS, true);
+    return;
   }
   pipe_write(musb_regs, epnum);
-  return false;
 }
 
-static bool handle_xfer_out(uint8_t rhport, uint_fast8_t ep_addr)
-{
-  unsigned epnum = tu_edpt_number(ep_addr);
-  unsigned epnum_minus1 = epnum - 1;
-  pipe_state_t  *pipe = &_dcd.pipe[tu_edpt_dir(ep_addr)][epnum_minus1];
-  musb_regs_t* musb_regs = MUSB_REGS(rhport);
+static void process_epout(uint8_t rhport, musb_regs_t *musb_regs, uint8_t epnum) {
   musb_ep_csr_t* ep_csr = get_ep_csr(musb_regs, epnum);
-  // TU_LOG1(" RXCSRL%d = %x\r\n", epnum_minus1 + 1, ep_csr->rx_csrl);
+  if (ep_csr->rx_csrl & MUSB_RXCSRL1_STALLED) {
+    ep_csr->rx_csrl &= ~(MUSB_RXCSRL1_STALLED | MUSB_RXCSRL1_OVER);
+    return; // sent STALL, do nothing
+  }
 
   //Fail gracefully. Spurious interrupt.
   if (!(ep_csr->rx_csrl & MUSB_RXCSRL1_RXRDY)) {
-    return false;
+    return;
   }
+
+  pipe_state_t *pipe = pipe_get(epnum, TUSB_DIR_OUT);
 
   if (!pipe->armed) {
     // Packet is already ACK'd by hardware and sitting in the Rx FIFO, but no transfer is
@@ -246,7 +281,7 @@ static bool handle_xfer_out(uint8_t rhport, uint_fast8_t ep_addr)
     // the FIFO stays occupied so hardware NAKs further OUT tokens (natural backpressure).
     // The next dcd_edpt_xfer() on this endpoint will drain the staged packet.
     musb_regs->intr_rxen &= (uint16_t) ~TU_BIT(epnum);
-    return false;
+    return;
   }
 
   const unsigned mps = ep_csr->rx_maxp;
@@ -266,20 +301,20 @@ static bool handle_xfer_out(uint8_t rhport, uint_fast8_t ep_addr)
 
   ep_csr->rx_csrl = 0; /* Always Clear RXRDY bit */
   if ((len < mps) || (rem == len)) {
+    const uint16_t xferred_len = pipe->length - pipe->remaining;
     pipe->buf = NULL;
     pipe->armed = false;
-    return true;
+
+    dcd_event_xfer_complete(rhport, tu_edpt_addr(epnum, TUSB_DIR_OUT), xferred_len, XFER_RESULT_SUCCESS, true);
   }
-  return false;
 }
 
 static bool edpt_n_xfer(uint8_t rhport, uint8_t ep_addr, void *buffer, uint16_t total_bytes, bool use_fifo)
 {
   unsigned epnum = tu_edpt_number(ep_addr);
-  unsigned epnum_minus1 = epnum - 1;
   unsigned dir_in       = tu_edpt_dir(ep_addr);
 
-  pipe_state_t *pipe = &_dcd.pipe[dir_in][epnum_minus1];
+  pipe_state_t *pipe = pipe_get(epnum, dir_in);
   if (use_fifo) {
     pipe->fifo = (tu_fifo_t *) buffer;
   } else {
@@ -296,16 +331,13 @@ static bool edpt_n_xfer(uint8_t rhport, uint8_t ep_addr, void *buffer, uint16_t 
     musb_regs_t* musb_regs = MUSB_REGS(rhport);
     musb_ep_csr_t* ep_csr = get_ep_csr(musb_regs, epnum);
 
-    // Re-enable Rx interrupt (may have been masked by the no-buffer path in handle_xfer_out)
+    // Re-enable Rx interrupt (may have been masked by the no-buffer path in process_epout)
     musb_regs->intr_rxen |= (uint16_t) TU_BIT(epnum);
 
-    // Drain any packet staged in the Rx FIFO from a prior no-buffer interrupt
+    // Drain any packet staged in the Rx FIFO from a prior no-buffer interrupt.
+    // process_epout() fires dcd_event_xfer_complete() itself if the drain completes.
     if (ep_csr->rx_csrl & MUSB_RXCSRL1_RXRDY) {
-      if (handle_xfer_out(rhport, ep_addr)) {
-        dcd_event_xfer_complete(rhport, ep_addr,
-                                pipe->length - pipe->remaining,
-                                XFER_RESULT_SUCCESS, false);
-      }
+      process_epout(rhport, musb_regs, (uint8_t) epnum);
     }
   }
   return true;
@@ -317,6 +349,7 @@ static bool edpt0_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_
   TU_ASSERT(total_bytes <= 64); /* Current implementation supports for only up to 64 bytes. */
   musb_regs_t* musb_regs = MUSB_REGS(rhport);
   musb_ep_csr_t* ep_csr = get_ep_csr(musb_regs, 0);
+  pipe_state_t* pipe0 = pipe_get(0, TUSB_DIR_OUT);
   const unsigned req = _dcd.setup_packet.bmRequestType;
   TU_ASSERT(req != REQUEST_TYPE_INVALID || total_bytes == 0);
 
@@ -347,9 +380,9 @@ static bool edpt0_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_
     if (dir_in) {
       tu_hwfifo_write(fifo_ptr, buffer, len, NULL);
 
-      _dcd.pipe0.buf       = buffer + len;
-      _dcd.pipe0.length    = len;
-      _dcd.pipe0.remaining = 0;
+      pipe0->buf       = buffer + len;
+      pipe0->length    = len;
+      pipe0->remaining = 0;
 
       _dcd.remaining_ctrl  = rem - len;
       if ((len < 64) || (rem == len)) {
@@ -360,19 +393,16 @@ static bool edpt0_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_
       } else {
         ep_csr->csr0l = MUSB_CSRL0_TXRDY; /* Flush TX FIFO to return ACK. */
       }
-      // TU_LOG1(" IN ep_csr->csr0l = %x\r\n", ep_csr->csr0l);
     } else {
-      // TU_LOG1(" OUT ep_csr->csr0l = %x\r\n", ep_csr->csr0l);
-      _dcd.pipe0.buf       = buffer;
-      _dcd.pipe0.length    = len;
-      _dcd.pipe0.remaining = len;
+      pipe0->buf       = buffer;
+      pipe0->length    = len;
+      pipe0->remaining = len;
       ep_csr->csr0l = MUSB_CSRL0_RXRDYC; /* Clear RX FIFO to return ACK. */
     }
   } else if (dir_in) {
-    // TU_LOG1(" STATUS IN ep_csr->csr0l  = %x\r\n", ep_csr->csr0l);
-    _dcd.pipe0.buf = NULL;
-    _dcd.pipe0.length    = 0;
-    _dcd.pipe0.remaining = 0;
+    pipe0->buf       = NULL;
+    pipe0->length    = 0;
+    pipe0->remaining = 0;
     /* Clear RX FIFO and reverse the transaction direction */
     ep_csr->csr0l = MUSB_CSRL0_RXRDYC | MUSB_CSRL0_DATAEND;
   }
@@ -383,9 +413,9 @@ static void process_ep0(uint8_t rhport)
 {
   musb_regs_t* musb_regs = MUSB_REGS(rhport);
   musb_ep_csr_t* ep_csr = get_ep_csr(musb_regs, 0);
+  pipe_state_t* pipe0 = pipe_get(0, TUSB_DIR_OUT);
   uint_fast8_t csrl = ep_csr->csr0l;
 
-  // TU_LOG1(" EP0 ep_csr->csr0l = %x\r\n", csrl);
   // 21.1.5: endpoint 0 service routine as peripheral
 
   if (csrl & MUSB_CSRL0_STALLED) {
@@ -398,13 +428,13 @@ static void process_ep0(uint8_t rhport)
   if (csrl & MUSB_CSRL0_SETEND) {
     TU_LOG1("   ABORT by the next packets\r\n");
     ep_csr->csr0l = MUSB_CSRL0_SETENDC;
-    if (req != REQUEST_TYPE_INVALID && _dcd.pipe0.buf) {
+    if (req != REQUEST_TYPE_INVALID && pipe0->buf) {
       /* DATA stage was aborted by receiving STATUS or SETUP packet. */
-      _dcd.pipe0.buf = NULL;
+      pipe0->buf = NULL;
       _dcd.setup_packet.bmRequestType = REQUEST_TYPE_INVALID;
       dcd_event_xfer_complete(rhport,
                               req & TUSB_DIR_IN_MASK,
-                              _dcd.pipe0.length - _dcd.pipe0.remaining,
+                              pipe0->length - pipe0->remaining,
                               XFER_RESULT_SUCCESS, true);
     }
     req = REQUEST_TYPE_INVALID;
@@ -419,21 +449,21 @@ static void process_ep0(uint8_t rhport)
       process_setup_packet(rhport);
       return;
     }
-    if (_dcd.pipe0.buf) {
+    if (pipe0->buf) {
       /* DATA OUT */
       const unsigned vld = ep_csr->count0;
-      const unsigned rem = _dcd.pipe0.remaining;
+      const unsigned rem = pipe0->remaining;
       const unsigned len = TU_MIN(TU_MIN(rem, 64), vld);
       volatile void *fifo_ptr = &musb_regs->fifo[0];
-      tu_hwfifo_read(fifo_ptr, _dcd.pipe0.buf, len, NULL);
+      tu_hwfifo_read(fifo_ptr, pipe0->buf, len, NULL);
 
-      _dcd.pipe0.remaining = rem - len;
+      pipe0->remaining = rem - len;
       _dcd.remaining_ctrl -= len;
 
-      _dcd.pipe0.buf = NULL;
+      pipe0->buf = NULL;
       dcd_event_xfer_complete(rhport,
                               tu_edpt_addr(0, TUSB_DIR_OUT),
-                              _dcd.pipe0.length - _dcd.pipe0.remaining,
+                              pipe0->length - pipe0->remaining,
                               XFER_RESULT_SUCCESS, true);
     }
     return;
@@ -450,49 +480,16 @@ static void process_ep0(uint8_t rhport)
     _dcd.setup_packet.bmRequestType = REQUEST_TYPE_INVALID;
     dcd_event_xfer_complete(rhport,
                             tu_edpt_addr(0, TUSB_DIR_IN),
-                            _dcd.pipe0.length - _dcd.pipe0.remaining,
+                            pipe0->length - pipe0->remaining,
                             XFER_RESULT_SUCCESS, true);
     return;
   }
-  if (_dcd.pipe0.buf) {
+  if (pipe0->buf) {
     /* DATA IN */
-    _dcd.pipe0.buf = NULL;
+    pipe0->buf = NULL;
     dcd_event_xfer_complete(rhport,
                             tu_edpt_addr(0, TUSB_DIR_IN),
-                            _dcd.pipe0.length - _dcd.pipe0.remaining,
-                            XFER_RESULT_SUCCESS, true);
-  }
-}
-
-static void process_edpt_n(uint8_t rhport, uint_fast8_t ep_addr)
-{
-  bool completed;
-  const unsigned dir_in = tu_edpt_dir(ep_addr);
-  const unsigned epn = tu_edpt_number(ep_addr);
-  const unsigned epn_minus1 = epn - 1;
-
-  musb_regs_t* musb_regs = MUSB_REGS(rhport);
-  musb_ep_csr_t* ep_csr = get_ep_csr(musb_regs, epn);
-  if (dir_in) {
-    // TU_LOG1(" TX CSRL%d = %x\r\n", epn, ep_csr->tx_csrl);
-    if (ep_csr->tx_csrl & MUSB_TXCSRL1_STALLED) {
-      ep_csr->tx_csrl &= ~(MUSB_TXCSRL1_STALLED | MUSB_TXCSRL1_UNDRN);
-      return;
-    }
-    completed = handle_xfer_in(musb_regs, (uint8_t) epn);
-  } else {
-    // TU_LOG1(" RX CSRL%d = %x\r\n", epn, ep_csr->rx_csrl);
-    if (ep_csr->rx_csrl & MUSB_RXCSRL1_STALLED) {
-      ep_csr->rx_csrl &= ~(MUSB_RXCSRL1_STALLED | MUSB_RXCSRL1_OVER);
-      return;
-    }
-    completed = handle_xfer_out(rhport, ep_addr);
-  }
-
-  if (completed) {
-    pipe_state_t *pipe = &_dcd.pipe[dir_in][epn_minus1];
-    dcd_event_xfer_complete(rhport, ep_addr,
-                            pipe->length - pipe->remaining,
+                            pipe0->length - pipe0->remaining,
                             XFER_RESULT_SUCCESS, true);
   }
 }
@@ -509,8 +506,9 @@ static void process_bus_reset(uint8_t rhport) {
   /* When bmRequestType is REQUEST_TYPE_INVALID(0xFF), a control transfer state is SETUP or STATUS stage. */
   _dcd.setup_packet.bmRequestType = REQUEST_TYPE_INVALID;
   _dcd.status_out = 0;
-  /* When pipe0.buf has not NULL, DATA stage works in progress. */
-  _dcd.pipe0.buf = NULL;
+  /* When EP0 pipe buf has not NULL, DATA stage works in progress. */
+  pipe_state_t* pipe0 = pipe_get(0, TUSB_DIR_OUT);
+  pipe0->buf = NULL;
 
   musb->intr_txen = 1; /* Enable only EP0 */
   musb->intr_rxen = 0;
@@ -578,10 +576,11 @@ void dcd_set_address(uint8_t rhport, uint8_t dev_addr)
   (void)dev_addr;
   musb_regs_t* musb_regs = MUSB_REGS(rhport);
   musb_ep_csr_t* ep_csr = get_ep_csr(musb_regs, 0);
+  pipe_state_t* pipe0 = pipe_get(0, TUSB_DIR_OUT);
 
-  _dcd.pipe0.buf       = NULL;
-  _dcd.pipe0.length    = 0;
-  _dcd.pipe0.remaining = 0;
+  pipe0->buf       = NULL;
+  pipe0->length    = 0;
+  pipe0->remaining = 0;
   /* Clear RX FIFO to return ACK. */
   ep_csr->csr0l = MUSB_CSRL0_RXRDYC | MUSB_CSRL0_DATAEND;
 }
@@ -635,7 +634,7 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const * ep_desc) {
   const unsigned dir_in  = tu_edpt_dir(ep_addr);
   const unsigned mps     = tu_edpt_packet_size(ep_desc);
 
-  pipe_state_t *pipe = &_dcd.pipe[dir_in][epn - 1];
+  pipe_state_t *pipe = pipe_get(epn, dir_in);
   pipe->buf       = NULL;
   pipe->length    = 0;
   pipe->remaining = 0;
@@ -681,7 +680,7 @@ bool dcd_edpt_iso_activate(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc )
   unsigned const ie = musb_dcd_get_int_enable(rhport);
   musb_dcd_int_disable(rhport);
 
-  pipe_state_t *pipe = &_dcd.pipe[dir_in][epn - 1];
+  pipe_state_t *pipe = pipe_get(epn, dir_in);
   pipe->buf       = NULL;
   pipe->length    = 0;
   pipe->remaining = 0;
@@ -792,13 +791,15 @@ void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr) {
   if (0 == epn) {
     if (!ep_addr) { /* Ignore EP80 */
       _dcd.setup_packet.bmRequestType = REQUEST_TYPE_INVALID;
-      _dcd.pipe0.buf = NULL;
+      pipe_state_t* pipe0 = pipe_get(0, TUSB_DIR_OUT);
+      pipe0->buf = NULL;
       ep_csr->csr0l = MUSB_CSRL0_STALL;
     }
   } else {
     const uint8_t is_rx = 1 - tu_edpt_dir(ep_addr);
     ep_csr->maxp_csr[is_rx].csrl = MUSB_CSRL_SEND_STALL(is_rx);
-    _dcd.pipe[tu_edpt_dir(ep_addr)][epn - 1].armed = false;
+    pipe_state_t* pipe = pipe_get(epn, tu_edpt_dir(ep_addr));
+    pipe->armed = false;
   }
 
   if (ie) musb_dcd_int_enable(rhport);
@@ -858,16 +859,16 @@ void dcd_int_handler(uint8_t rhport) {
     intr_tx &= ~TU_BIT(0);
   }
   while (intr_tx) {
-    unsigned const num = __builtin_ctz(intr_tx);
-    process_edpt_n(rhport, tu_edpt_addr(num, TUSB_DIR_IN));
-    intr_tx &= ~TU_BIT(num);
+    const unsigned epnum = __builtin_ctz(intr_tx);
+    process_epin(rhport, musb_regs, epnum);
+    intr_tx &= ~TU_BIT(epnum);
   }
 
   intr_rx &= musb_regs->intr_rxen; /* Clear disabled interrupts */
   while (intr_rx) {
-    unsigned const num = __builtin_ctz(intr_rx);
-    process_edpt_n(rhport, tu_edpt_addr(num, TUSB_DIR_OUT));
-    intr_rx &= ~TU_BIT(num);
+    unsigned const epnum = __builtin_ctz(intr_rx);
+    process_epout(rhport, musb_regs, epnum);
+    intr_rx &= ~TU_BIT(epnum);
   }
 
   musb_regs->index = saved_index; // restore endpoint index
