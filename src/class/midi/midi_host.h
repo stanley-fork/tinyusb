@@ -47,7 +47,7 @@ extern "C" {
 #endif
 
 #ifndef CFG_TUH_MIDI_TX_BUFSIZE
-  #define CFG_TUH_MIDI_TX_BUFSIZE (2 * TUH_EPSIZE_BULK_MAX)
+  #define CFG_TUH_MIDI_TX_BUFSIZE TUH_EPSIZE_BULK_MAX
 #endif
 
 #ifndef CFG_TUH_MIDI_EP_BUFSIZE
