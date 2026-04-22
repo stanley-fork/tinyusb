@@ -38,11 +38,16 @@ extern "C" {
 // Class Driver Configuration
 //--------------------------------------------------------------------+
 #ifndef CFG_TUH_MIDI_RX_BUFSIZE
-  #define CFG_TUH_MIDI_RX_BUFSIZE TUH_EPSIZE_BULK_MAX
+  // Default sized to 2x the bulk endpoint to absorb residue left in the FIFO
+  // when tuh_midi_stream_read() stops early on a cable-number transition.
+  // Sizing this equal to the endpoint packet size (the historical default)
+  // can cause the next bulk IN transfer to fail to queue silently, wedging
+  // the stream. See the drain-loop note on tuh_midi_stream_read() below.
+  #define CFG_TUH_MIDI_RX_BUFSIZE (2 * TUH_EPSIZE_BULK_MAX)
 #endif
 
 #ifndef CFG_TUH_MIDI_TX_BUFSIZE
-  #define CFG_TUH_MIDI_TX_BUFSIZE TUH_EPSIZE_BULK_MAX
+  #define CFG_TUH_MIDI_TX_BUFSIZE (2 * TUH_EPSIZE_BULK_MAX)
 #endif
 
 #ifndef CFG_TUH_MIDI_EP_BUFSIZE
@@ -150,6 +155,13 @@ uint32_t tuh_midi_stream_write(uint8_t idx, uint8_t cable_num, const uint8_t *p_
 // Note that this function ignores the CIN field of the MIDI packet
 // because a number of commercial devices out there do not encode
 // it properly.
+//
+// NOTE: this function terminates when it encounters an event whose cable
+// number differs from the one being returned. Applications should invoke
+// it in a loop until it returns 0 (or until tuh_midi_read_available()
+// returns 0) to guarantee the stream FIFO is fully drained per callback.
+// Leaving bytes in the FIFO across callbacks can prevent subsequent bulk
+// IN transfers from landing.
 uint32_t tuh_midi_stream_read(uint8_t idx, uint8_t *p_cable_num, uint8_t *p_buffer, uint16_t bufsize);
 
 #endif
