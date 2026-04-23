@@ -48,8 +48,8 @@
 #define LWIP_IP_ACCEPT_UDP_PORT(p)      ((p) == PP_NTOHS(67))
 
 #define TCP_MSS                         (1500 /*mtu*/ - 20 /*iphdr*/ - 20 /*tcphhr*/)
-#define TCP_SND_BUF                     (4 * TCP_MSS)
-#define TCP_WND                         (4 * TCP_MSS)
+#define TCP_SND_BUF                     (8 * TCP_MSS)
+#define TCP_WND                         (8 * TCP_MSS)
 
 #define ETHARP_SUPPORT_STATIC_ENTRIES   1
 
@@ -60,7 +60,9 @@
 #define LWIP_SINGLE_NETIF               1
 #define LWIP_NETIF_LINK_CALLBACK        1
 
-#define PBUF_POOL_SIZE                  4
+#define PBUF_POOL_SIZE                  8
+// Must grow in step with TCP_SND_BUF (default MEMP_NUM_TCP_SEG=16 caps TCP_SND_BUF at 4*MSS).
+#define MEMP_NUM_TCP_SEG                32
 
 #define HTTPD_USE_CUSTOM_FSDATA         0
 
