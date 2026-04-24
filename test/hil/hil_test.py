@@ -738,56 +738,80 @@ def test_device_cdc_msc(board):
     data = read_disk_file(uid, 0, 'README.TXT')
     assert data == MSC_README_TXT, f'MSC wrong data in README.TXT\n expected: {MSC_README_TXT.decode()}\n received: {data.decode()}'
 
-    # MSC dd throughput test: read all sectors then write back same data
+
+def test_device_cdc_msc_freertos(board):
+    test_device_cdc_msc(board)
+
+
+def test_device_cdc_msc_throughput(board):
+    uid = board['uid']
+
+    def parse_speed(dd_output):
+        for line in dd_output.splitlines():
+            m = re.search(r'([\d.]+)\s+([kMG]?B)/s', line)
+            if m:
+                return f'{float(m.group(1)):.1f} {m.group(2)}ps'
+        return '?'
+
+    # Wait for MSC disk enumeration
     dev = get_disk_dev(uid, 'TinyUSB', 0)
     timeout = ENUM_TIMEOUT
     while timeout > 0:
         if os.path.exists(dev):
             break
-        time.sleep(1)
-        timeout -= 1
-    assert timeout > 0, f'Disk {dev} not found for dd test'
+        time.sleep(0.1); timeout -= 0.1
+    assert timeout > 0, f'Disk {dev} not found'
 
-    block_count = 16
-    block_size = 512
-    tmp_file = f'/tmp/msc_dd_{uid}.bin'
+    # Wait for CDC tty enumeration
+    tty = get_serial_dev(uid, 'TinyUSB', 'Throughput', 0)
+    timeout = ENUM_TIMEOUT
+    while timeout > 0:
+        if os.path.exists(tty):
+            break
+        time.sleep(0.1); timeout -= 0.1
+    assert timeout > 0, f'CDC tty {tty} not found'
 
-    # dd reports speed based on payload only. Each block also transfers 31-byte CBW + 13-byte CSW on USB.
-    scsi_ratio = (block_size + 31 + 13) / block_size
+    # Detect speed (12 Mbps FS / 480 Mbps HS) for payload scaling
+    is_fs = False
+    for f in glob.glob('/sys/bus/usb/devices/*/serial'):
+        try:
+            if open(f).read().strip() == uid:
+                is_fs = (open(os.path.join(os.path.dirname(f), 'speed')).read().strip() == '12')
+                break
+        except (OSError, ValueError):
+            pass
 
-    def parse_dd_speed(dd_output):
-        """Parse dd output, return USB-adjusted speed string"""
-        for line in dd_output.splitlines():
-            m = re.search(r'([\d.]+)\s+([kMG]?B/s)', line)
-            if m:
-                speed_val = float(m.group(1)) * scsi_ratio
-                return f'{speed_val:.1f} {m.group(2)}'
-        return ''
+    # Put tty in raw mode so dd sees pure binary throughput.
+    run_cmd(f'stty -F {tty} raw -echo')
 
-    # Read: dd from device to file
-    ret = run_cmd(f'dd if={dev} of={tmp_file} bs={block_size} count={block_count} iflag=direct 2>&1')
-    assert ret.returncode == 0, f'dd read failed: {ret.stdout.decode()}'
-    read_speed = parse_dd_speed(ret.stdout.decode())
+    # Payload aim: ~5 s per direction at FS (~830 kB/s), much less at HS.
+    msc_count = 2 if is_fs else 16    # bs=1M
+    cdc_count = 16 if is_fs else 128  # bs=64K
 
-    # Write back the same data to avoid corrupting the disk (skip if read-only)
-    ret = run_cmd(f'dd if={tmp_file} of={dev} bs={block_size} count={block_count} oflag=direct 2>&1')
-    if ret.returncode != 0 and 'Read-only' in ret.stdout.decode():
-        write_speed = 'skip (read-only)'
-    else:
-        assert ret.returncode == 0, f'dd write failed: {ret.stdout.decode()}'
-        write_speed = parse_dd_speed(ret.stdout.decode())
+    tmp_file = f'/tmp/cdc_msc_tp_{uid}.bin'
+
+    rw = run_cmd(f'timeout 30 dd if=/dev/zero of={tty} bs=64K count={cdc_count} 2>&1')
+    assert rw.returncode == 0, f'CDC dd write failed: {rw.stdout.decode()}'
+    cdc_w = parse_speed(rw.stdout.decode())
+
+    rr = run_cmd(f'timeout 30 dd if={tty} of=/dev/null bs=64K count={cdc_count} iflag=fullblock 2>&1')
+    assert rr.returncode == 0, f'CDC dd read failed: {rr.stdout.decode()}'
+    cdc_r = parse_speed(rr.stdout.decode())
+
+    rmr = run_cmd(f'dd if={dev} of={tmp_file} bs=1M count={msc_count} iflag=direct 2>&1')
+    assert rmr.returncode == 0, f'MSC dd read failed: {rmr.stdout.decode()}'
+    msc_r = parse_speed(rmr.stdout.decode())
+
+    rmw = run_cmd(f'dd if={tmp_file} of={dev} bs=1M count={msc_count} oflag=direct 2>&1')
+    assert rmw.returncode == 0, f'MSC dd write failed: {rmw.stdout.decode()}'
+    msc_w = parse_speed(rmw.stdout.decode())
 
     try:
         os.remove(tmp_file)
     except OSError:
         pass
 
-    if read_speed and write_speed:
-        print(f'  dd read: {read_speed}, write: {write_speed}', end='')
-
-
-def test_device_cdc_msc_freertos(board):
-    test_device_cdc_msc(board)
+    print(f'  CDC read {cdc_r} write {cdc_w}, MSC read {msc_r} write {msc_w}  ', end='')
 
 
 def test_device_dfu(board):
@@ -1201,6 +1225,7 @@ device_tests = [
     'device/cdc_dual_ports',
     'device/dfu',
     'device/cdc_msc',
+    'device/cdc_msc_throughput',
     'device/dfu_runtime',
     'device/cdc_msc_freertos',
     'device/hid_boot_interface',
