@@ -999,8 +999,7 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
 
         case NCM_SET_ETHERNET_PACKET_FILTER: {
           tud_control_xfer(rhport, request, NULL, 0);
-        } break;            
-          
+        } break;
 
           // unsupported request
         default:

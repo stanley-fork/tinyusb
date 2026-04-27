@@ -50,6 +50,16 @@ typedef enum
   NCM_DATA_PROTOCOL_NETWORK_TRANSFER_BLOCK = 0x01
 } ncm_data_interface_protocol_code_t;
 
+// Table 5.2 bmNetworkCapabilities bits
+typedef enum {
+  NCM_NETWORK_CAPS_NONE              = 0x00,
+  NCM_NETWORK_CAPS_ETH_FILTER        = (1 << 0),
+  NCM_NETWORK_CAPS_NET_ADDRESS       = (1 << 1),
+  NCM_NETWORK_CAPS_ENCAP_COMMAND     = (1 << 2),
+  NCM_NETWORK_CAPS_MAX_DATAGRAM_SIZE = (1 << 3),
+  NCM_NETWORK_CAPS_CRC_MODE          = (1 << 4),
+  NCM_NETWORK_CAPS_NTB_INPUT_SIZE    = (1 << 5)
+} ncm_network_capabilities_t;
 
 #ifdef __cplusplus
  extern "C" {
