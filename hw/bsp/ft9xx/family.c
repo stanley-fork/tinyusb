@@ -221,8 +221,8 @@ int board_uart_read(uint8_t *buf, int len)
 // Send characters to UART
 int board_uart_write(void const *buf, int len)
 {
-    int count = 0;
 #ifdef BOARD_UART
+    int count = 0;
     uint8_t const *p = (uint8_t const *) buf;
     while (count < len) {
         if (BOARD_UART->LSR_ICR_XON2 & MASK_UART_LSR_THRE) {
