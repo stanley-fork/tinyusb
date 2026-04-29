@@ -30,7 +30,7 @@ Infer from the user's request:
 - **Example:** named example → `-e <group>/<name>` (e.g. `-e device/cdc_msc`). "All examples" → omit `-e`.
 - **Bloaty:** only with `-e`. Use when the user wants a section/symbol-level breakdown for a single binary.
 - **Base ref:** default `master`. Override with `--base-branch <ref>` (tag or commit also works).
-- **Filter:** default `tinyusb/src` (only counts TinyUSB stack code, not example/BSP). Change only if asked.
+- **Filter:** default is the absolute path of each side's `<checkout>/src/` directory, which uniquely identifies TinyUSB stack code without matching vendored deps that also have a `src/` (e.g. `pico-sdk/src/`). Override with one or more `-f SUBSTRING` flags to use repo-relative substrings instead. Change only if asked.
 
 ## Common invocations
 
@@ -72,5 +72,5 @@ Use timeouts ≥ 10 minutes (600000 ms) for `--ci`.
 
 After running:
 - Show the markdown report's summary table to the user.
-- Highlight any rows with non-zero diff in `tinyusb/src` paths — those are the actual stack-size deltas.
+- Highlight any rows with non-zero `% diff` — under the default filter every row is a TinyUSB stack source file (e.g. `usbd.c`, `cdc_device.c`, `dcd_<port>.c`), so any non-zero delta is a real stack-size impact.
 - If the diff is unexpected, follow up with a single-example `--bloaty` run to localize.

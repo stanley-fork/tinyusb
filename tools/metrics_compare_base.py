@@ -37,12 +37,20 @@ verbose = False
 
 
 def run(cmd, **kwargs):
-    """Run a command. cmd must be a list (no shell=True)."""
+    """Run a command. cmd must be a list (no shell=True). On `timeout=`-induced
+    TimeoutExpired, return a CompletedProcess with rc=124 instead of letting the
+    exception propagate, so the caller can fall through to error reporting and
+    worktree cleanup rather than crashing with a traceback."""
     if not isinstance(cmd, list):
         raise TypeError('run() requires a list, got str — fix the caller')
     if verbose:
         print(f'  $ {" ".join(shlex.quote(str(c)) for c in cmd)}')
-    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    except subprocess.TimeoutExpired as e:
+        msg = f'Command timed out after {e.timeout}s: {" ".join(shlex.quote(str(c)) for c in cmd)}'
+        stderr = (e.stderr or '') + ('\n' if e.stderr else '') + msg
+        return subprocess.CompletedProcess(cmd, 124, stdout=(e.stdout or ''), stderr=stderr)
 
 
 def symlink_deps(main_root, worktree_dir):
