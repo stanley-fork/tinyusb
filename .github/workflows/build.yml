@@ -261,15 +261,15 @@ jobs:
   # ---------------------------------------
   hil-tinyusb:
     needs: hil-build
-    name: HIL - ${{ matrix.display }}
+    name: hil-tinyusb (${{ matrix.display }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - display: hathach tinyusb
+          - display: tinyusb.json
             runner: [ self-hosted, X64, hathach, hardware-in-the-loop ]
             hil_json: test/hil/tinyusb.json
-          - display: hifiphile hfp
+          - display: hfp.json
             runner: [ self-hosted, Linux, X64, hifiphile ]
             hil_json: test/hil/hfp.json
     runs-on: ${{ matrix.runner }}
