@@ -115,7 +115,20 @@ TU_ATTR_WEAK bool dcd_dcache_clean_invalidate(const void* addr, uint32_t data_si
 //--------------------------------------------------------------------+
 // Device Data
 //--------------------------------------------------------------------+
+
+// Per-control-transfer state: populated at process_setup_received() entry,
+// consumed asynchronously by usbd_control_xfer_cb() when the EP0 transfer completes.
 typedef struct {
+  tusb_control_request_t request;
+  uint8_t* buffer;
+  uint16_t data_len;
+  uint16_t total_xferred;
+  usbd_control_xfer_cb_t complete_cb;
+} usbd_control_xfer_t;
+
+typedef struct {
+  usbd_control_xfer_t ctrl_xfer;
+
   // Note: these may share an enum state
   volatile uint8_t connected;
   volatile uint8_t addressed;
@@ -141,6 +154,10 @@ typedef struct {
 
 static usbd_device_t    _usbd_dev;
 static volatile uint8_t _usbd_queued_setup;
+
+CFG_TUD_MEM_SECTION static struct {
+  TUD_EPBUF_DEF(buf, CFG_TUD_ENDPOINT0_BUFSIZE);
+} _ctrl_epbuf;
 
 //--------------------------------------------------------------------+
 // Class Driver
@@ -405,7 +422,7 @@ TU_ATTR_ALWAYS_INLINE static inline bool queue_event(dcd_event_t const * event, 
 //--------------------------------------------------------------------+
 // Prototypes
 //--------------------------------------------------------------------+
-static bool process_control_request(uint8_t rhport, tusb_control_request_t const * p_request);
+static bool process_setup_received(uint8_t rhport, tusb_control_request_t const * p_request);
 static bool process_set_config(uint8_t rhport, uint8_t cfg_num);
 static bool process_get_descriptor(uint8_t rhport, tusb_control_request_t const * p_request);
 
@@ -420,8 +437,6 @@ static bool process_test_mode_cb(uint8_t rhport, uint8_t stage, tusb_control_req
 #endif
 
 // Control Endpoint
-static void usbd_control_reset(void);
-static void usbd_control_set_complete_callback(usbd_control_xfer_cb_t fp);
 static bool usbd_control_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes);
 
 //--------------------------------------------------------------------+
@@ -457,17 +472,6 @@ static char const *const _usbd_event_str[DCD_EVENT_COUNT] = {
     "Xfer Complete",
     "Func Call"
 };
-
-// for usbd_control to print the name of control complete driver
-void usbd_driver_print_control_complete_name(usbd_control_xfer_cb_t callback) {
-  for (uint8_t i = 0; i < TOTAL_DRIVER_COUNT; i++) {
-    usbd_class_driver_t const* driver = get_driver(i);
-    if (driver && driver->control_xfer_cb == callback) {
-      TU_LOG_USBD("%s control complete\r\n", driver->name);
-      return;
-    }
-  }
-}
 
 #endif
 
@@ -608,9 +612,7 @@ bool tud_deinit(uint8_t rhport) {
     }
   }
 
-  // Clear device data
-  tu_varclr(&_usbd_dev);
-  usbd_control_reset();
+  tu_varclr(&_usbd_dev); // Clear device data
 
   // Deinit device queue & task
   osal_queue_delete(_usbd_q);
@@ -645,7 +647,6 @@ static void configuration_reset(uint8_t rhport) {
 
 static void usbd_reset(uint8_t rhport) {
   configuration_reset(rhport);
-  usbd_control_reset();
 }
 
 bool tud_task_event_ready(void) {
@@ -731,7 +732,7 @@ void tud_task_ext(uint32_t timeout_ms, bool in_isr) {
         _usbd_dev.ep_status[0][TUSB_DIR_IN].claimed = 0;
 
         // Process control request
-        if (!process_control_request(event.rhport, &event.setup_received)) {
+        if (!process_setup_received(event.rhport, &event.setup_received)) {
           TU_LOG_USBD("  Stall EP0\r\n");
           // Failed -> stall both control endpoint IN and OUT
           dcd_edpt_stall(event.rhport, 0);
@@ -817,20 +818,6 @@ TU_ATTR_WEAK void dcd_edpt0_status_complete(uint8_t rhport, const tusb_control_r
   (void) request;
 }
 
-typedef struct {
-  tusb_control_request_t request;
-  uint8_t* buffer;
-  uint16_t data_len;
-  uint16_t total_xferred;
-  usbd_control_xfer_cb_t complete_cb;
-} usbd_control_xfer_t;
-
-static usbd_control_xfer_t _ctrl_xfer;
-
-CFG_TUD_MEM_SECTION static struct {
-  TUD_EPBUF_DEF(buf, CFG_TUD_ENDPOINT0_BUFSIZE);
-} _ctrl_epbuf;
-
 uint8_t* usbd_get_ctrl_buf(void) {
   return _ctrl_epbuf.buf;
 }
@@ -850,13 +837,14 @@ TU_ATTR_ALWAYS_INLINE static inline bool status_stage_xact(uint8_t rhport, uint8
 // Queue a transaction in Data Stage. Each transaction has up to Endpoint0's max
 // packet size. This function can also transfer a zero-length packet.
 static bool data_stage_xact(uint8_t rhport) {
-  const uint16_t xact_len = tu_min16(_ctrl_xfer.data_len - _ctrl_xfer.total_xferred, CFG_TUD_ENDPOINT0_BUFSIZE);
+  usbd_control_xfer_t* const ctrl_xfer = &_usbd_dev.ctrl_xfer;
+  const uint16_t xact_len = tu_min16(ctrl_xfer->data_len - ctrl_xfer->total_xferred, CFG_TUD_ENDPOINT0_BUFSIZE);
   uint8_t ep_addr = TU_EP0_OUT;
 
-  if (_ctrl_xfer.request.bmRequestType_bit.direction == TUSB_DIR_IN) {
+  if (ctrl_xfer->request.bmRequestType_bit.direction == TUSB_DIR_IN) {
     ep_addr = TU_EP0_IN;
-    if (0u != xact_len && _ctrl_xfer.buffer != _ctrl_epbuf.buf) {
-      TU_VERIFY(0 == tu_memcpy_s(_ctrl_epbuf.buf, CFG_TUD_ENDPOINT0_BUFSIZE, _ctrl_xfer.buffer, xact_len));
+    if (0u != xact_len && ctrl_xfer->buffer != _ctrl_epbuf.buf) {
+      TU_VERIFY(0 == tu_memcpy_s(_ctrl_epbuf.buf, CFG_TUD_ENDPOINT0_BUFSIZE, ctrl_xfer->buffer, xact_len));
     }
   }
 
@@ -865,20 +853,21 @@ static bool data_stage_xact(uint8_t rhport) {
 
 // Status phase
 bool tud_control_status(uint8_t rhport, const tusb_control_request_t* request) {
-  // _ctrl_xfer fields are pre-initialized at process_control_request entry
+  // _usbd_dev.ctrl_xfer fields are pre-initialized at process_setup_received entry
   (void) request;
-  return status_stage_xact(rhport, status_stage_ep(&_ctrl_xfer.request));
+  return status_stage_xact(rhport, status_stage_ep(&_usbd_dev.ctrl_xfer.request));
 }
 
 // Transmit data to/from the control endpoint. If wLength is zero, a status packet is sent instead.
 bool tud_control_xfer(uint8_t rhport, const tusb_control_request_t* request, void* buffer, uint16_t len) {
-  // _ctrl_xfer.request and reset fields are pre-initialized at process_control_request entry
+  // _usbd_dev.ctrl_xfer.request and reset fields are pre-initialized at process_setup_received entry
   (void) request;
-  _ctrl_xfer.buffer = (uint8_t*) buffer;
-  _ctrl_xfer.data_len = tu_min16(len, _ctrl_xfer.request.wLength);
+  usbd_control_xfer_t* const ctrl_xfer = &_usbd_dev.ctrl_xfer;
+  ctrl_xfer->buffer = (uint8_t*) buffer;
+  ctrl_xfer->data_len = tu_min16(len, ctrl_xfer->request.wLength);
 
-  if (_ctrl_xfer.request.wLength > 0U) {
-    if (_ctrl_xfer.data_len > 0U) {
+  if (ctrl_xfer->request.wLength > 0U) {
+    if (ctrl_xfer->data_len > 0U) {
       TU_ASSERT(buffer);
     }
     TU_ASSERT(data_stage_xact(rhport));
@@ -890,57 +879,46 @@ bool tud_control_xfer(uint8_t rhport, const tusb_control_request_t* request, voi
   return true;
 }
 
-static void usbd_control_reset(void) {
-  tu_varclr(&_ctrl_xfer);
-}
-
-static void usbd_control_set_complete_callback(usbd_control_xfer_cb_t fp) {
-  _ctrl_xfer.complete_cb = fp;
-}
-
 // Callback when a transaction completes on the DATA stage or Status stage of EP0
 static bool usbd_control_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
   (void) result;
+  usbd_control_xfer_t* const ctrl_xfer = &_usbd_dev.ctrl_xfer;
 
   // Status Stage complete: ep_addr matches the resolved Status stage endpoint
-  uint8_t const ep_status = status_stage_ep(&_ctrl_xfer.request);
+  uint8_t const ep_status = status_stage_ep(&ctrl_xfer->request);
   if (ep_addr == ep_status) {
     TU_ASSERT(0 == xferred_bytes);
 
     // invoke optional dcd hook if available
-    dcd_edpt0_status_complete(rhport, &_ctrl_xfer.request);
+    dcd_edpt0_status_complete(rhport, &ctrl_xfer->request);
 
-    if (NULL != _ctrl_xfer.complete_cb) {
-      // TODO refactor with usbd_driver_print_control_complete_name
-      _ctrl_xfer.complete_cb(rhport, CONTROL_STAGE_ACK, &_ctrl_xfer.request);
+    if (NULL != ctrl_xfer->complete_cb) {
+      ctrl_xfer->complete_cb(rhport, CONTROL_STAGE_ACK, &ctrl_xfer->request);
     }
 
     return true;
   }
 
   // Data stage progress
-  if (_ctrl_xfer.request.bmRequestType_bit.direction == TUSB_DIR_OUT) {
-    TU_VERIFY(_ctrl_xfer.buffer);
-    if (_ctrl_xfer.buffer != _ctrl_epbuf.buf) {
-      memcpy(_ctrl_xfer.buffer, _ctrl_epbuf.buf, xferred_bytes);
+  if (ctrl_xfer->request.bmRequestType_bit.direction == TUSB_DIR_OUT) {
+    TU_VERIFY(ctrl_xfer->buffer);
+    if (ctrl_xfer->buffer != _ctrl_epbuf.buf) {
+      memcpy(ctrl_xfer->buffer, _ctrl_epbuf.buf, xferred_bytes);
     }
-    TU_LOG_MEM(CFG_TUD_LOG_LEVEL, _ctrl_xfer.buffer, xferred_bytes, 2);
+    TU_LOG_MEM(CFG_TUD_LOG_LEVEL, ctrl_xfer->buffer, xferred_bytes, 2);
   }
 
-  _ctrl_xfer.total_xferred += (uint16_t) xferred_bytes;
-  _ctrl_xfer.buffer += xferred_bytes;
+  ctrl_xfer->total_xferred += (uint16_t) xferred_bytes;
+  ctrl_xfer->buffer += xferred_bytes;
 
   // Data Stage complete when wLength reached or short packet (incl. ZLP) seen
-  if ((_ctrl_xfer.request.wLength == _ctrl_xfer.total_xferred) ||
+  if ((ctrl_xfer->request.wLength == ctrl_xfer->total_xferred) ||
       (xferred_bytes < CFG_TUD_ENDPOINT0_BUFSIZE)) {
     bool is_ok = true;
 
-    if (NULL != _ctrl_xfer.complete_cb) {
-      #if CFG_TUSB_DEBUG >= CFG_TUD_LOG_LEVEL
-      usbd_driver_print_control_complete_name(_ctrl_xfer.complete_cb);
-      #endif
+    if (NULL != ctrl_xfer->complete_cb) {
       // Callback can still stall control in status phase, e.g. OUT data doesn't make sense
-      is_ok = _ctrl_xfer.complete_cb(rhport, CONTROL_STAGE_DATA, &_ctrl_xfer.request);
+      is_ok = ctrl_xfer->complete_cb(rhport, CONTROL_STAGE_DATA, &ctrl_xfer->request);
     }
 
     if (is_ok) {
@@ -964,27 +942,28 @@ static bool usbd_control_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t 
 
 // Helper to invoke class driver control request handler
 static bool invoke_class_control(uint8_t rhport, usbd_class_driver_t const * driver, tusb_control_request_t const * request) {
-  usbd_control_set_complete_callback(driver->control_xfer_cb);
+  _usbd_dev.ctrl_xfer.complete_cb = driver->control_xfer_cb;
   TU_LOG_USBD("  %s control request\r\n", driver->name);
   return driver->control_xfer_cb(rhport, CONTROL_STAGE_SETUP, request);
 }
 
 // This handles the actual request and its response.
 // Returns false if unable to complete the request, causing caller to stall control endpoints.
-static bool process_control_request(uint8_t rhport, tusb_control_request_t const * p_request) {
+static bool process_setup_received(uint8_t rhport, tusb_control_request_t const * p_request) {
   // Initialize control transfer state for this request. The request copy must be
   // visible to usbd_control_xfer_cb when the (asynchronous) status ZLP completes,
   // since the SETUP packet event has already gone out of scope by then.
-  _ctrl_xfer.request = *p_request;
-  _ctrl_xfer.buffer = NULL;
-  _ctrl_xfer.total_xferred = 0;
-  _ctrl_xfer.data_len = 0;
-  _ctrl_xfer.complete_cb = NULL;
+  usbd_control_xfer_t* const ctrl_xfer = &_usbd_dev.ctrl_xfer;
+  ctrl_xfer->request = *p_request;
+  ctrl_xfer->buffer = NULL;
+  ctrl_xfer->total_xferred = 0;
+  ctrl_xfer->data_len = 0;
+  ctrl_xfer->complete_cb = NULL;
   TU_ASSERT(p_request->bmRequestType_bit.type < TUSB_REQ_TYPE_INVALID);
 
   // Vendor request
   if ( p_request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR ) {
-    usbd_control_set_complete_callback(tud_vendor_control_xfer_cb);
+    ctrl_xfer->complete_cb = tud_vendor_control_xfer_cb;
     return tud_vendor_control_xfer_cb(rhport, CONTROL_STAGE_SETUP, p_request);
   }
 
@@ -1022,8 +1001,6 @@ static bool process_control_request(uint8_t rhport, tusb_control_request_t const
           // Depending on mcu, status phase could be sent either before or after changing device address,
           // or even require stack to not response with status at all
           // Therefore DCD must take full responsibility to response and include zlp status packet if needed.
-          // _ctrl_xfer.request was already populated at process_control_request() entry, so the
-          // status ZLP that the DCD queues will be recognized by usbd_control_xfer_cb().
           dcd_set_address(rhport, (uint8_t) p_request->wValue);
           _usbd_dev.addressed = 1;
         break;
@@ -1092,7 +1069,7 @@ static bool process_control_request(uint8_t rhport, tusb_control_request_t const
               uint8_t const selector = tu_u16_high(p_request->wIndex);
               TU_VERIFY(TUSB_FEATURE_TEST_J <= selector && selector <= TUSB_FEATURE_TEST_FORCE_ENABLE);
 
-              usbd_control_set_complete_callback(process_test_mode_cb);
+              ctrl_xfer->complete_cb = process_test_mode_cb;
               tud_control_status(rhport, p_request);
               break;
             }
@@ -1161,7 +1138,7 @@ static bool process_control_request(uint8_t rhport, tusb_control_request_t const
         TU_VERIFY(TUSB_REQ_TYPE_STANDARD == p_request->bmRequestType_bit.type);
 
         // Clear complete callback if driver set since it can also stall the request.
-        usbd_control_set_complete_callback(NULL);
+        ctrl_xfer->complete_cb = NULL;
 
         switch (p_request->bRequest) { //-V2520
           case TUSB_REQ_GET_INTERFACE: {
@@ -1219,7 +1196,7 @@ static bool process_control_request(uint8_t rhport, tusb_control_request_t const
               // STD request must always be ACKed regardless of driver returned value
               // Also clear complete callback if driver set since it can also stall the request.
               (void) invoke_class_control(rhport, driver, p_request);
-              usbd_control_set_complete_callback(NULL);
+              ctrl_xfer->complete_cb = NULL;
 
               // skip ZLP status if driver already did that
               if (!_usbd_dev.ep_status[0][TUSB_DIR_IN].busy) {
@@ -1301,8 +1278,7 @@ static bool process_set_config(uint8_t rhport, uint8_t cfg_num) {
 }
 
 // return descriptor's buffer and update desc_len
-static bool process_get_descriptor(uint8_t rhport, tusb_control_request_t const * p_request)
-{
+static bool process_get_descriptor(uint8_t rhport, tusb_control_request_t const * p_request) {
   tusb_desc_type_t const desc_type = (tusb_desc_type_t) tu_u16_high(p_request->wValue);
   uint8_t const desc_index = tu_u16_low( p_request->wValue );
 
