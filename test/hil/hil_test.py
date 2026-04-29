@@ -58,7 +58,9 @@ STATUS_SKIPPED = "\033[33mSkipped\033[0m"
 
 verbose = False
 test_only = []
+board_test = {}
 build_dir = 'cmake-build'
+skip_flash = False
 
 WCH_RISCV_CONTENT = """
 adapter driver wlinke
@@ -737,56 +739,81 @@ def test_device_cdc_msc(board):
     data = read_disk_file(uid, 0, 'README.TXT')
     assert data == MSC_README_TXT, f'MSC wrong data in README.TXT\n expected: {MSC_README_TXT.decode()}\n received: {data.decode()}'
 
-    # MSC dd throughput test: read all sectors then write back same data
+
+def test_device_cdc_msc_freertos(board):
+    test_device_cdc_msc(board)
+
+
+def test_device_cdc_msc_throughput(board):
+    uid = board['uid']
+
+    def parse_speed(dd_output):
+        for line in dd_output.splitlines():
+            m = re.search(r'([\d.]+)\s+([kMG]?B)/s', line)
+            if m:
+                return f'{float(m.group(1)):.1f} {m.group(2)}ps'
+        return '?'
+
+    # Wait for MSC disk enumeration
     dev = get_disk_dev(uid, 'TinyUSB', 0)
     timeout = ENUM_TIMEOUT
     while timeout > 0:
         if os.path.exists(dev):
             break
-        time.sleep(1)
-        timeout -= 1
-    assert timeout > 0, f'Disk {dev} not found for dd test'
+        time.sleep(0.1); timeout -= 0.1
+    assert timeout > 0, f'Disk {dev} not found'
 
-    block_count = 16
-    block_size = 512
-    tmp_file = f'/tmp/msc_dd_{uid}.bin'
+    # Wait for CDC tty enumeration
+    tty = get_serial_dev(uid, 'TinyUSB', 'Throughput', 0)
+    timeout = ENUM_TIMEOUT
+    while timeout > 0:
+        if os.path.exists(tty):
+            break
+        time.sleep(0.1); timeout -= 0.1
+    assert timeout > 0, f'CDC tty {tty} not found'
 
-    # dd reports speed based on payload only. Each block also transfers 31-byte CBW + 13-byte CSW on USB.
-    scsi_ratio = (block_size + 31 + 13) / block_size
+    # Detect speed (12 Mbps FS / 480 Mbps HS) for payload scaling
+    is_fs = False
+    for f in glob.glob('/sys/bus/usb/devices/*/serial'):
+        try:
+            if open(f).read().strip() == uid:
+                is_fs = (open(os.path.join(os.path.dirname(f), 'speed')).read().strip() == '12')
+                break
+        except (OSError, ValueError):
+            pass
 
-    def parse_dd_speed(dd_output):
-        """Parse dd output, return USB-adjusted speed string"""
-        for line in dd_output.splitlines():
-            m = re.search(r'([\d.]+)\s+([kMG]?B/s)', line)
-            if m:
-                speed_val = float(m.group(1)) * scsi_ratio
-                return f'{speed_val:.1f} {m.group(2)}'
-        return ''
+    # Put tty in raw mode so dd sees pure binary throughput.
+    rs = run_cmd(f'timeout 30 stty -F {tty} raw -echo')
+    assert rs.returncode == 0, f'stty failed: {rs.stdout.decode()}'
 
-    # Read: dd from device to file
-    ret = run_cmd(f'dd if={dev} of={tmp_file} bs={block_size} count={block_count} iflag=direct 2>&1')
-    assert ret.returncode == 0, f'dd read failed: {ret.stdout.decode()}'
-    read_speed = parse_dd_speed(ret.stdout.decode())
+    # Payload aim: ~5 s per direction at FS (~830 kB/s), much less at HS.
+    msc_count = 2 if is_fs else 16    # bs=1M
+    cdc_count = 16 if is_fs else 128  # bs=64K
 
-    # Write back the same data to avoid corrupting the disk (skip if read-only)
-    ret = run_cmd(f'dd if={tmp_file} of={dev} bs={block_size} count={block_count} oflag=direct 2>&1')
-    if ret.returncode != 0 and 'Read-only' in ret.stdout.decode():
-        write_speed = 'skip (read-only)'
-    else:
-        assert ret.returncode == 0, f'dd write failed: {ret.stdout.decode()}'
-        write_speed = parse_dd_speed(ret.stdout.decode())
+    tmp_file = f'/tmp/cdc_msc_tp_{uid}.bin'
+
+    rw = run_cmd(f'timeout 30 dd if=/dev/zero of={tty} bs=64K count={cdc_count} 2>&1')
+    assert rw.returncode == 0, f'CDC dd write failed: {rw.stdout.decode()}'
+    cdc_w = parse_speed(rw.stdout.decode())
+
+    rr = run_cmd(f'timeout 30 dd if={tty} of=/dev/null bs=64K count={cdc_count} iflag=fullblock 2>&1')
+    assert rr.returncode == 0, f'CDC dd read failed: {rr.stdout.decode()}'
+    cdc_r = parse_speed(rr.stdout.decode())
+
+    rmr = run_cmd(f'dd if={dev} of={tmp_file} bs=1M count={msc_count} iflag=direct 2>&1')
+    assert rmr.returncode == 0, f'MSC dd read failed: {rmr.stdout.decode()}'
+    msc_r = parse_speed(rmr.stdout.decode())
+
+    rmw = run_cmd(f'dd if={tmp_file} of={dev} bs=1M count={msc_count} oflag=direct 2>&1')
+    assert rmw.returncode == 0, f'MSC dd write failed: {rmw.stdout.decode()}'
+    msc_w = parse_speed(rmw.stdout.decode())
 
     try:
         os.remove(tmp_file)
     except OSError:
         pass
 
-    if read_speed and write_speed:
-        print(f'  dd read: {read_speed}, write: {write_speed}', end='')
-
-
-def test_device_cdc_msc_freertos(board):
-    test_device_cdc_msc(board)
+    print(f'  CDC read {cdc_r} write {cdc_w}, MSC read {msc_r} write {msc_w}  ', end='')
 
 
 def test_device_dfu(board):
@@ -1028,6 +1055,65 @@ def test_device_mtp(board):
         mtp.disconnect()
 
 
+def test_device_net_lwip_webserver(board):
+    # MAC hard-coded in examples/device/net_lwip_webserver/src/main.c; Linux names the
+    # USB network interface enx<MAC_lowercase_no_colons>. Device IP is 192.168.7.1 and
+    # the example runs an iperf2 TCP server on port 5001 (INCLUDE_IPERF).
+    import socket
+    mac_no_colons = '0202846a9600'
+    iface = 'enx' + mac_no_colons
+    device_ip = '192.168.7.1'
+    iperf_port = 5001
+
+    # Wait for the host to get an IPv4 address in the device's subnet (DHCP served by the device).
+    # USB enum + DHCP serve can take longer on the CI HIL hardware than on local — give it 30s.
+    iface_timeout = 30
+    deadline = time.time() + iface_timeout
+    host_ip = None
+    while time.time() < deadline:
+        ret = subprocess.run(['ip', '-o', '-4', 'addr', 'show', iface],
+                             capture_output=True, text=True, timeout=2)
+        m = re.search(r'inet (192\.168\.7\.\d+)/', ret.stdout) if ret.returncode == 0 else None
+        if m:
+            host_ip = m.group(1)
+            break
+        time.sleep(0.5)
+    assert host_ip, f'USB net iface {iface} did not come up with 192.168.7.x within {iface_timeout}s'
+
+    # Poll the iperf TCP port until the device is accepting. The net stack comes up a bit
+    # after DHCP completes; iperf server binding isn't instantaneous after reflash.
+    deadline = time.time() + ENUM_TIMEOUT
+    last_err = None
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((device_ip, iperf_port), timeout=1):
+                last_err = None
+                break
+        except OSError as e:
+            last_err = e
+            time.sleep(0.3)
+    assert last_err is None, f'iperf TCP {device_ip}:{iperf_port} not accepting within {ENUM_TIMEOUT}s: {last_err}'
+
+    # Throughput: 5-second iperf2 TCP test, CSV output for stable parsing.
+    # iperf2 CSV final summary line: timestamp,src_ip,src_port,dst_ip,dst_port,id,interval,bytes,bps
+    ret = subprocess.run(['iperf', '-c', device_ip, '-t', '5', '-y', 'C'],
+                         capture_output=True, text=True, timeout=30)
+    stderr = ret.stderr.strip()
+    stdout = ret.stdout.strip()
+    assert ret.returncode == 0, f'iperf rc={ret.returncode}: stderr={stderr!r} stdout={stdout!r}'
+    lines = [l for l in stdout.splitlines() if l]
+    assert lines, f'iperf produced no output (rc={ret.returncode}, stderr={stderr!r})'
+    try:
+        bps = int(lines[-1].split(',')[-1])
+    except (ValueError, IndexError) as e:
+        raise AssertionError(f'could not parse iperf output: {lines[-1]!r} ({e})')
+    mbps = bps / 1e6
+    print(f'  iperf {mbps:5.1f} Mbps', end='')
+
+    # Reject implausibly low throughput - a working USB-net link should clear this easily.
+    assert mbps >= 1.0, f'iperf throughput too low: {mbps:.2f} Mbps'
+
+
 def test_device_msc_dual_lun(board):
     uid = board['uid']
 
@@ -1143,6 +1229,7 @@ device_tests = [
     'device/cdc_dual_ports',
     'device/dfu',
     'device/cdc_msc',
+    'device/cdc_msc_throughput',
     'device/dfu_runtime',
     'device/cdc_msc_freertos',
     'device/hid_boot_interface',
@@ -1150,7 +1237,8 @@ device_tests = [
     'device/hid_generic_inout',
     'device/printer_to_cdc',
     'device/midi_test',
-    'device/mtp'
+    'device/mtp',
+    # 'device/net_lwip_webserver',  # disabled for PR #3605: USB net iface enum is flaky on the CI HIL host
 ]
 
 dual_tests = [
@@ -1190,11 +1278,15 @@ def test_example(board, f1, example):
     if verbose:
         print(f'Flashing {fw_name}.elf')
 
-    # flash firmware. It may fail randomly, retry a few times
+    # flash firmware (unless --skip-flash), then run the test. Both may fail randomly,
+    # retry a few times.
     start_s = time.time()
+    flash_ok = True
     for i in range(max_retry):
-        ret = globals()[f'flash_{board["flasher"]["name"].lower()}'](board, fw_name)
-        if ret.returncode == 0:
+        if not skip_flash:
+            ret = globals()[f'flash_{board["flasher"]["name"].lower()}'](board, fw_name)
+            flash_ok = (ret.returncode == 0)
+        if flash_ok:
             try:
                 tret = globals()[f'test_{example.replace("/", "_")}'](board)
                 if tret == 'skipped':
@@ -1213,13 +1305,39 @@ def test_example(board, f1, example):
             print(f'\n  Flash failed, retry {i+2}/{max_retry}', end='')
             time.sleep(0.5)
 
-    if ret.returncode != 0:
+    if not flash_ok:
         err_count += 1
         print(f'  Flash {STATUS_FAILED}', end='')
 
     print(f'  in {time.time() - start_s:.1f}s')
 
     return err_count
+
+
+def build_board(board):
+    """Build firmware for this board via tools/build.py.
+    Honors board config's build.flags_on variants and build.args defines.
+    Output goes to cmake-build/cmake-build-BOARD[-f1_...]/ (tools/build.py layout)."""
+    name = board['name']
+    bcfg = board.get('build', {})
+    flags_on_list = bcfg.get('flags_on', [''])
+    extra_defs = bcfg.get('args', [])
+
+    failed = 0
+    for f1 in flags_on_list:
+        cmd = [sys.executable, f'{TINYUSB_ROOT}/tools/build.py', '-b', name]
+        for d in extra_defs:
+            cmd += ['-D', d]
+        if f1:
+            for flag in f1.split():
+                cmd += ['-f1', flag]
+        if verbose:
+            cmd.append('-v')
+            print(f'  + {" ".join(cmd)}')
+        r = subprocess.run(cmd, cwd=TINYUSB_ROOT)
+        if r.returncode != 0:
+            failed += 1
+    return name, failed
 
 
 def test_board(board):
@@ -1229,7 +1347,9 @@ def test_board(board):
     # default to all tests
     test_list = []
 
-    if len(test_only) > 0:
+    if name in board_test:
+        test_list = board_test[name]
+    elif len(test_only) > 0:
         test_list = test_only
     else:
         if 'tests' in board:
@@ -1249,18 +1369,23 @@ def test_board(board):
                         print(f'{name:25} {skip:30} ... Skip')
 
     err_count = 0
+    failed_tests = []
     flags_on_list = [""]
     if 'build' in board and 'flags_on' in board['build']:
         flags_on_list = board['build']['flags_on']
 
     for f1 in flags_on_list:
         for test in test_list:
-            err_count += test_example(board, f1, test)
+            ec = test_example(board, f1, test)
+            err_count += ec
+            if ec > 0:
+                failed_tests.append(test)
 
-    # flash board_test last to disable board's usb
-    test_example(board, flags_on_list[0], 'device/board_test')
+    # flash board_test last to disable board's usb (skipped when --skip-flash is set)
+    if not skip_flash:
+        test_example(board, flags_on_list[0], 'device/board_test')
 
-    return name, err_count
+    return name, err_count, sorted(set(failed_tests))
 
 
 def main():
@@ -1269,28 +1394,40 @@ def main():
     """
     global verbose
     global test_only
+    global board_test
     global build_dir
     global max_retry
+    global skip_flash
 
     duration = time.time()
 
     parser = argparse.ArgumentParser()
     parser.add_argument('config_file', help='Configuration JSON file')
     parser.add_argument('-b', '--board', action='append', default=[], help='Boards to test, all if not specified')
-    parser.add_argument('-s', '--skip', action='append', default=[], help='Skip boards from test')
+    parser.add_argument('-s', '--skip-board', action='append', default=[], help='Skip boards from test')
+    parser.add_argument('-sf', '--skip-flash', action='store_true', help='Run tests without flashing firmware (use whatever is already on the board)')
     parser.add_argument('-t', '--test-only', action='append', default=[], help='Tests to run, all if not specified')
-    parser.add_argument('-B', '--build', default='cmake-build', help='Build folder name (default: cmake-build)')
+    parser.add_argument('-bt', '--board-test', action='append', default=[],
+                        help='Per-board test list as BOARD:test1,test2 (overrides -t for that board); repeat for multiple boards')
+    parser.add_argument('-B', '--build-dir', default='cmake-build', help='Build folder name (default: cmake-build)')
+    parser.add_argument('--build', action='store_true', help='Build firmware for selected boards with cmake before running tests')
     parser.add_argument('-r', '--retry', type=int, default=3, help='Retry count for failed tests (default: 3)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     args = parser.parse_args()
 
     config_file = args.config_file
     boards = args.board
-    skip_boards = args.skip
+    skip_boards = args.skip_board
     verbose = args.verbose
     test_only = args.test_only
-    build_dir = args.build
+    for entry in args.board_test:
+        bname, _, tnames = entry.partition(':')
+        if not bname or not tnames:
+            parser.error(f'invalid --board-test value: {entry!r} (expected BOARD:test1,test2)')
+        board_test[bname] = [t for t in tnames.split(',') if t]
+    build_dir = args.build_dir
     max_retry = args.retry
+    skip_flash = args.skip_flash
 
     # if config file is not found, try to find it in the same directory as this script
     if not os.path.exists(config_file):
@@ -1303,16 +1440,33 @@ def main():
     else:
         config_boards = [e for e in config['boards'] if e['name'] in boards]
 
-    err_count = 0
+    build_err = 0
+    if args.build:
+        if build_dir != 'cmake-build':
+            print(f'warning: --build writes into cmake-build/, but -B is {build_dir!r}; '
+                  f'tests will not find the freshly built firmware')
+        print('-' * 30)
+        print(f'Build phase: {len(config_boards)} board(s)')
+        print('-' * 30)
+        for board in config_boards:
+            _, nfail = build_board(board)
+            build_err += nfail
+        print('-' * 30)
+        print(f'Build phase done: {build_err} failed')
+        print('-' * 30)
+
     with Pool(processes=os.cpu_count()) as pool:
         mret = pool.map(test_board, config_boards)
-        err_count = sum(e[1] for e in mret)
-        # generate skip list for next re-run if failed
+        err_count = build_err + sum(e[1] for e in mret)
+        # generate skip list for next re-run if failed: skip boards that fully passed,
+        # and emit -bt BOARD:t1,t2 so each failed board only re-runs its own failed tests.
         skip_fname = f'{config_file}.skip'
         if err_count > 0:
-            skip_boards += [name for name, err in mret if err == 0]
+            skip_boards += [name for name, err, _ in mret if err == 0]
+            parts = [f'--skip-board {i}' for i in skip_boards]
+            parts += [f'-bt {name}:{",".join(fts)}' for name, err, fts in mret if err > 0 and fts]
             with open(skip_fname, 'w') as f:
-                f.write(' '.join(f'-s {i}' for i in skip_boards))
+                f.write(' '.join(parts))
         elif os.path.exists(skip_fname):
             os.remove(skip_fname)
 
