@@ -118,6 +118,16 @@ typedef struct {
   bool notification_xmit_is_running;                    // notification is currently transmitted
   bool link_is_up;                                      // current link state
 
+  // host-configured transmit limits
+  uint32_t xmit_max_ntb_size;                           // maximum NTB size device may send
+  uint16_t xmit_max_datagrams;                          // maximum datagrams per NTB device may send
+  uint8_t ntb_input_size_len;                           // last SET_NTB_INPUT_SIZE wLength
+  struct {
+    uint32_t dwNtbInMaxSize;
+    uint16_t wNtbInMaxDatagrams;
+    uint16_t wReserved;
+  } ntb_input_size;
+
   // misc
   bool tud_network_recv_renew_active;                   // tud_network_recv_renew() is active (avoid recursive invocations)
   bool tud_network_recv_renew_process_again;            // tud_network_recv_renew() should process again
@@ -415,10 +425,14 @@ static bool xmit_requested_datagram_fits_into_current_ntb(uint16_t datagram_size
   if (ncm_interface.xmit_glue_ntb == NULL) {
     return false;
   }
-  if (ncm_interface.xmit_glue_ntb_datagram_ndx >= CFG_TUD_NCM_IN_MAX_DATAGRAMS_PER_NTB) {
+  uint16_t max_datagrams = ncm_interface.xmit_max_datagrams;
+  if (max_datagrams == 0) {
+    max_datagrams = CFG_TUD_NCM_IN_MAX_DATAGRAMS_PER_NTB;
+  }
+  if (ncm_interface.xmit_glue_ntb_datagram_ndx >= max_datagrams) {
     return false;
   }
-  if (ncm_interface.xmit_glue_ntb->nth.wBlockLength + datagram_size + XMIT_ALIGN_OFFSET(datagram_size) > CFG_TUD_NCM_IN_NTB_MAX_SIZE) {
+  if (ncm_interface.xmit_glue_ntb->nth.wBlockLength + datagram_size + XMIT_ALIGN_OFFSET(datagram_size) > ncm_interface.xmit_max_ntb_size) {
     return false;
   }
   return true;
@@ -715,7 +729,7 @@ static void recv_transfer_datagram_to_glue_logic(void) {
 bool tud_network_can_xmit(uint16_t size) {
   TU_LOG_DRV("tud_network_can_xmit(%d)\n", size);
 
-  TU_ASSERT(size <= CFG_TUD_NCM_IN_NTB_MAX_SIZE - (sizeof(nth16_t) + sizeof(ndp16_t) + 2 * sizeof(ndp16_datagram_t)), false);
+  TU_ASSERT(size <= ncm_interface.xmit_max_ntb_size - (sizeof(nth16_t) + sizeof(ndp16_t) + 2 * sizeof(ndp16_datagram_t)), false);
 
   if (xmit_requested_datagram_fits_into_current_ntb(size) || xmit_setup_next_glue_ntb()) {
     // -> everything is fine
@@ -834,6 +848,9 @@ void netd_init(void) {
   TU_LOG_DRV("netd_init()\n");
 
   memset(&ncm_interface, 0, sizeof(ncm_interface));
+
+  ncm_interface.xmit_max_ntb_size = CFG_TUD_NCM_IN_NTB_MAX_SIZE;
+  ncm_interface.xmit_max_datagrams = CFG_TUD_NCM_IN_MAX_DATAGRAMS_PER_NTB;
 
   for (int i = 0; i < XMIT_NTB_N; ++i) {
     ncm_interface.xmit_free_ntb[i] = &ncm_epbuf.xmit[i].ntb;
@@ -961,12 +978,12 @@ bool netd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
  * At startup transmission of notification packets are done here.
  */
 bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request) {
-  if (stage != CONTROL_STAGE_SETUP) {
-    return true;
-  }
 
   switch (request->bmRequestType_bit.type) {
     case TUSB_REQ_TYPE_STANDARD:
+      if (stage != CONTROL_STAGE_SETUP) {
+        return true;
+      }
 
       switch (request->bRequest) {
         case TUSB_REQ_GET_INTERFACE: {
@@ -1000,21 +1017,70 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
       TU_VERIFY(ncm_interface.itf_num == request->wIndex, false);
       switch (request->bRequest) {
         case NCM_GET_NTB_PARAMETERS: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
           // transfer NTB parameters to host.
           tud_control_xfer(rhport, request, (void *) (uintptr_t) &ntb_parameters, sizeof(ntb_parameters));
         } break;
 
         case NCM_SET_ETHERNET_PACKET_FILTER: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
           tud_network_set_packet_filter_cb(request->wValue);
           tud_control_xfer(rhport, request, NULL, 0);
         } break;
 
-          // unsupported request
+        case NCM_SET_NTB_INPUT_SIZE: {
+          if (stage == CONTROL_STAGE_SETUP) {
+            if (request->wLength != 4 && request->wLength != 8) {
+              return false;
+            }
+
+            ncm_interface.ntb_input_size_len = (uint8_t) request->wLength;
+            memset(&ncm_interface.ntb_input_size, 0, sizeof(ncm_interface.ntb_input_size));
+
+            // wLength == 8 -> the NTB Input Size Structure
+            // wLength == 4 -> dwNtbInMaxSize field of the NTB Input Size Structure.
+            if (request->wLength == 4) {
+              tud_control_xfer(rhport, request, &ncm_interface.ntb_input_size.dwNtbInMaxSize, 4);
+            } else {
+              tud_control_xfer(rhport, request, &ncm_interface.ntb_input_size, 8);
+            }
+          } else if (stage == CONTROL_STAGE_ACK) {
+            uint32_t requested_size = ncm_interface.ntb_input_size.dwNtbInMaxSize;
+            uint16_t requested_datagrams = 0;
+            uint32_t min_ntb_size = 2048u;
+            uint32_t new_ntb_size = 0;
+            uint16_t new_datagrams = 0;
+
+            if (requested_size < min_ntb_size || requested_size > CFG_TUD_NCM_IN_NTB_MAX_SIZE) {
+              return false;
+            }
+            new_ntb_size = requested_size;
+
+            if (ncm_interface.ntb_input_size_len == 8) {
+              requested_datagrams = ncm_interface.ntb_input_size.wNtbInMaxDatagrams;
+            }
+
+            if (requested_datagrams > CFG_TUD_NCM_IN_MAX_DATAGRAMS_PER_NTB) {
+              return false;
+            }
+            new_datagrams = requested_datagrams;
+
+            ncm_interface.xmit_max_ntb_size = new_ntb_size;
+            ncm_interface.xmit_max_datagrams = new_datagrams;
+          }
+        } break;
+
+        // unsupported request
         default:
           return false;
       }
       break;
-      // unsupported request
+
+    // unsupported request
     default:
       return false;
   }
