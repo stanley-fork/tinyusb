@@ -9,7 +9,7 @@ Run TinyUSB HIL tests against real boards. Two execution modes — **local** (bo
 
 ## Prerequisites
 
-- Examples must already be built for the target board(s). See AGENTS.md "Build" section, Option 2 (all examples for a board), which produces `examples/cmake-build-BOARD_NAME/`.
+- Examples must already be built for the target board(s). See AGENTS.md "Build" → "All examples for a board", which produces `examples/cmake-build-<board>/`.
 - `-B examples` tells `hil_test.py` that `examples/` is the parent folder containing the per-board build outputs.
 
 ## Choosing arguments
@@ -17,51 +17,42 @@ Run TinyUSB HIL tests against real boards. Two execution modes — **local** (bo
 Infer from the user's request:
 
 - **Mode:** `local` (default) or `remote`. Only switch to `remote` if the user explicitly says so or names `ci.lan`.
-- **Board:** if the user names a specific board, pass `-b BOARD_NAME`. Otherwise run all boards in the config.
+- **Board:** if the user names a specific board, pass `-b BOARD_NAME`. Otherwise omit `-b` to run all boards in the config.
 - **Pass-through flags:** `-v` (verbose), `-r N` (retry count), etc. — pass through unchanged.
 
 Config file follows from mode:
-- **Local** → `local.json`
-- **Remote** → `tinyusb.json`
+- **Local** → `test/hil/local.json` (user-supplied; not tracked in repo — describes boards attached locally)
+- **Remote** → `test/hil/tinyusb.json` (tracked; describes the `ci.lan` test rig)
+
+If `local.json` is missing, fall back to `tinyusb.json` only when explicitly told to; otherwise stop and ask the user to supply one.
 
 ## Local execution
 
 Boards attached to this machine:
 
 ```bash
-python test/hil/hil_test.py -b BOARD_NAME -B examples local.json $EXTRA_ARGS
-# or for all boards in the config:
-python test/hil/hil_test.py -B examples local.json $EXTRA_ARGS
+# Specific board:
+python3 test/hil/hil_test.py -b BOARD_NAME -B examples test/hil/local.json $EXTRA_ARGS
+# All boards in the config (no -b):
+python3 test/hil/hil_test.py -B examples test/hil/local.json $EXTRA_ARGS
 ```
 
 ## Remote execution (ci.lan)
 
-Copy only the minimal files needed (firmware binaries + test script + config), then run remotely:
+Use `test/hil/hil_ci.sh` — it handles dir setup, scp of test scripts, rsync of firmware artifacts (`.elf` / `.bin` / `.hex` only), and running `hil_test.py` on `ci.lan`:
 
 ```bash
-REMOTE=ci.lan
-REMOTE_DIR=/tmp/tinyusb-hil
-
-# Create remote working directory
-ssh $REMOTE "rm -rf $REMOTE_DIR && mkdir -p $REMOTE_DIR/test/hil"
-
-# Copy HIL test script and its dependency
-scp test/hil/hil_test.py test/hil/pymtp.py test/hil/tinyusb.json $REMOTE:$REMOTE_DIR/test/hil/
-
-# Copy firmware binaries
 # Specific board:
-scp -r examples/cmake-build-$BOARD_NAME $REMOTE:$REMOTE_DIR/examples/
-# Or all built boards:
-# for dir in examples/cmake-build-*/; do scp -r "$dir" $REMOTE:$REMOTE_DIR/examples/; done
-
-# Run the test remotely
-ssh $REMOTE "cd $REMOTE_DIR && python3 test/hil/hil_test.py -b $BOARD_NAME -B examples tinyusb.json $EXTRA_ARGS"
+bash test/hil/hil_ci.sh -b raspberry_pi_pico2
+# All boards in tinyusb.json:
+bash test/hil/hil_ci.sh
+# Pass-through extra args (any non -b flag is forwarded to hil_test.py):
+bash test/hil/hil_ci.sh -b raspberry_pi_pico2 -t host/cdc_msc_hid -r 1
 ```
 
-The remote machine (`ci.lan`) must have:
-- Python 3 with `pyserial` installed (`pip install pyserial`)
-- Flasher tools: `JLinkExe`, `openocd`, etc. as needed by the board
-- USB access to the boards (udev rules configured)
+Overrides via env vars: `REMOTE=ci.lan`, `REMOTE_DIR=/tmp/tinyusb-hil`, `CONFIG=test/hil/tinyusb.json`.
+
+The script fails fast if the build dir or repo layout is missing.
 
 ## Timing
 

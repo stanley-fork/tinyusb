@@ -38,10 +38,11 @@ cmake -DBOARD=raspberry_pi_pico -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel ..
 cmake --build .
 ```
 
-All examples for a board (15-20 s; some objcopy failures are non-critical):
+All examples for a board (15-20 s; some objcopy failures are non-critical). Use `cmake-build-<board>` as the build dir — HIL tests expect that exact name:
 ```bash
-cd examples && mkdir -p build && cd build
-cmake -DBOARD=raspberry_pi_pico -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel .. && cmake --build .
+cd examples
+cmake -B cmake-build-raspberry_pi_pico -DBOARD=raspberry_pi_pico -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel .
+cmake --build cmake-build-raspberry_pi_pico
 ```
 
 Single example with Make:
@@ -65,16 +66,28 @@ idf.py -DBOARD=espressif_s3_devkitc build
 ## Flash
 
 ```bash
-ninja cdc_msc-jlink     | make BOARD=… flash-jlink        # JLink
-ninja cdc_msc-openocd   | make BOARD=… flash-openocd      # OpenOCD
-ninja cdc_msc-uf2       | make BOARD=… all uf2            # UF2
+# JLink
+ninja cdc_msc-jlink                                       # CMake
+make BOARD=<board> flash-jlink                            # Make
+
+# OpenOCD
+ninja cdc_msc-openocd                                     # CMake
+make BOARD=<board> flash-openocd                          # Make
+
+# UF2
+ninja cdc_msc-uf2                                         # CMake
+make BOARD=<board> all uf2                                # Make
+
 ninja -t targets                                          # list CMake targets
-idf.py -DBOARD=… flash|monitor                            # Espressif (after export.sh)
+
+# Espressif (after . $HOME/code/esp-idf/export.sh)
+idf.py -DBOARD=<board> flash
+idf.py -DBOARD=<board> monitor
 ```
 
 ## GDB Debugging
 
-Look up `JLINK_DEVICE` / `OPENOCD_OPTION` in `hw/bsp/*/boards/*/board.cmake`.
+Look up `JLINK_DEVICE` / `OPENOCD_OPTION` in `hw/bsp/*/boards/*/board.cmake` (CMake builds) or `board.mk` (Make builds).
 
 **JLink — Terminal 1:**
 ```bash
@@ -83,7 +96,9 @@ JLinkGDBServer -device stm32h743xi -if SWD -speed 4000 -port 2331 -swoport 2332 
 
 **OpenOCD — Terminal 1:**
 ```bash
-openocd -f interface/stlink.cfg -f target/stm32h7x.cfg      # or interface/jlink.cfg
+openocd -f interface/stlink.cfg -f target/stm32h7x.cfg
+# or with a J-Link interface:
+openocd -f interface/jlink.cfg -f target/stm32h7x.cfg
 # rp2040/rp2350 via CMSIS-DAP:
 openocd -f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 5000"
 ```
@@ -108,7 +123,7 @@ sudo gem install ceedling
 cd test/unit-test && ceedling test:all        # or ceedling test:test_fifo
 ```
 
-**HIL (2-5 min):** invoke the `hil` skill (`.claude/skills/hil/SKILL.md`) for the full procedure (local vs remote mode, config selection, SSH copy steps, debugging tips). Requires pre-built examples (Build Option 2).
+**HIL (2-5 min):** invoke the `hil` skill (`.claude/skills/hil/SKILL.md`) for the full procedure (local vs remote mode, config selection, SSH copy steps, debugging tips). Requires pre-built examples — see Build → "All examples for a board".
 
 ## Documentation
 
@@ -146,20 +161,30 @@ python3 tools/metrics.py combine -j -m -f tinyusb/src cmake-build/cmake-build-*/
 Requires `compile_commands.json` (CMake `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`).
 
 ```bash
+# Whole project:
 pvs-studio-analyzer analyze \
   -f examples/cmake-build-raspberry_pi_pico/compile_commands.json \
-  -R .PVS-Studio/.pvsconfig [-S path/to/file.c ...] \
+  -R .PVS-Studio/.pvsconfig \
   -o pvs-report.log -j12 --dump-files \
   --misra-c-version 2023 --misra-cpp-version 2008 --use-old-parser
+
+# Specific files (add one or more `-S <file>`):
+pvs-studio-analyzer analyze \
+  -f examples/cmake-build-raspberry_pi_pico/compile_commands.json \
+  -R .PVS-Studio/.pvsconfig \
+  -S src/foo.c -S src/bar.c \
+  -o pvs-report.log -j12 --dump-files \
+  --misra-c-version 2023 --misra-cpp-version 2008 --use-old-parser
+
 plog-converter -a GA:1,2 -t errorfile pvs-report.log     # view results
 ```
 
-Add `-S <file>` (repeatable) to restrict to specific sources. ~10-30 s.
+Takes ~10-30 s.
 
 ## Validation After Changes
 
 1. `pre-commit run --all-files` — format, spell, unit tests (10-15 s).
-2. Build at least one board's full example set (Build Option 2) for modules you touched.
+2. Build at least one board's full example set (Build → "All examples for a board") for modules you touched.
 3. Run relevant unit tests; add fuzz/HIL coverage for parsers or protocol state machines.
 
 **Boards good for local testing:**
