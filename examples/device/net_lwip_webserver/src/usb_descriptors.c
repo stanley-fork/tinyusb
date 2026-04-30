@@ -162,9 +162,9 @@ static uint8_t const ncm_configuration[] = {
   TUD_CONFIG_DESCRIPTOR(CONFIG_ID_NCM + 1, ITF_NUM_TOTAL, 0, NCM_CONFIG_TOTAL_LEN, 0, 100),
 
   // Interface number, description string index, MAC address string index, EP notification address and size, EP data address (out, in), and size, max segment size.
-  TUD_CDC_NCM_DESCRIPTOR(
-      ITF_NUM_CDC, STRID_INTERFACE, STRID_MAC, EPNUM_NET_NOTIF, 64, EPNUM_NET_OUT, EPNUM_NET_IN,
-      CFG_TUD_NET_ENDPOINT_SIZE, CFG_TUD_NET_MTU),
+  TUD_CDC_NCM_DESCRIPTOR(ITF_NUM_CDC, STRID_INTERFACE, STRID_MAC,
+      EPNUM_NET_NOTIF, 64, EPNUM_NET_OUT, EPNUM_NET_IN, CFG_TUD_NET_ENDPOINT_SIZE,
+      CFG_TUD_NET_MTU, NCM_NETWORK_CAPS_ETH_FILTER),
 };
 
 #endif
