@@ -164,7 +164,7 @@ static uint8_t const ncm_configuration[] = {
   // Interface number, description string index, MAC address string index, EP notification address and size, EP data address (out, in), and size, max segment size.
   TUD_CDC_NCM_DESCRIPTOR(ITF_NUM_CDC, STRID_INTERFACE, STRID_MAC,
       EPNUM_NET_NOTIF, 64, EPNUM_NET_OUT, EPNUM_NET_IN, CFG_TUD_NET_ENDPOINT_SIZE,
-      CFG_TUD_NET_MTU, NCM_NETWORK_CAPS_ETH_FILTER),
+      CFG_TUD_NET_MTU, (uint8_t)((uint8_t)NCM_NETWORK_CAPS_ETH_FILTER | (uint8_t)NCM_NETWORK_CAPS_NTB_INPUT_SIZE)),
 };
 
 #endif
