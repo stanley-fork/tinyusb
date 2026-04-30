@@ -138,6 +138,13 @@ typedef struct {
 static ncm_interface_t ncm_interface;
 CFG_TUD_MEM_SECTION static ncm_epbuf_t ncm_epbuf;
 
+//--------------------------------------------------------------------+
+// Weak stubs: invoked if no strong implementation is available
+//--------------------------------------------------------------------+
+TU_ATTR_WEAK void tud_network_set_packet_filter_cb(uint16_t packet_filter) {
+  (void) packet_filter;
+}
+
 /**
  * This is the NTB parameter structure
  *
@@ -998,6 +1005,7 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
         } break;
 
         case NCM_SET_ETHERNET_PACKET_FILTER: {
+          tud_network_set_packet_filter_cb(request->wValue);
           tud_control_xfer(rhport, request, NULL, 0);
         } break;
 

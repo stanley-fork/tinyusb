@@ -106,6 +106,9 @@ extern uint8_t tud_network_mac_address[6];
 
 //------------- NCM -------------//
 
+// Optional callback: informs the application about host requested packet filter bits
+void tud_network_set_packet_filter_cb(uint16_t packet_filter);
+
 // Set the network link state (up/down) and notify the host
 void tud_network_link_state(uint8_t rhport, bool is_up);
 
