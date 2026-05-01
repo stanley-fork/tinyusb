@@ -43,7 +43,7 @@
             },
             "flasher": {
                 "name": "jlink",
-                "uid": "000682804350",
+                "uid": "681295394",
                 "args": "-device nrf52840_xxaa"
             }
         },
@@ -184,11 +184,6 @@
                 "device": false, "host": true, "dual": false,
                 "dev_attached": [
                     {
-                        "vid_pid": "1a86_55d4",
-                        "serial": "52D2002694",
-                        "is_cdc": true
-                    },
-                    {
                         "vid_pid": "0951_1603",
                         "serial": "820000000000000045B46338",
                         "is_msc": true,
@@ -226,6 +221,9 @@
         {
             "name": "stm32f072disco",
             "uid": "3A001A001357364230353532",
+            "tests": {
+                "device": true, "host": false, "dual": false
+            },
             "flasher": {
                 "name": "jlink",
                 "uid": "779541626",

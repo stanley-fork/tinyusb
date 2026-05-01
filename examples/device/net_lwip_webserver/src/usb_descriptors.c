@@ -121,12 +121,20 @@ const uint8_t *tud_descriptor_device_cb(void) {
 #define EPNUM_NET_OUT   0x02
 #define EPNUM_NET_IN    0x81
 
-#elif defined(TUD_ENDPOINT_ONE_DIRECTION_ONLY)
-// MCUs that don't support a same endpoint number with different direction IN and OUT defined in tusb_mcu.h
+#elif CFG_TUD_ENDPOINT_ONE_DIRECTION_ONLY
+// MCUs that don't support the same endpoint number with different direction IN and OUT defined in tusb_mcu.h
 //    e.g EP1 OUT & EP1 IN cannot exist together
+
+#if TU_CHECK_MCU(OPT_MCU_MAX32650, OPT_MCU_MAX32666, OPT_MCU_MAX32690, OPT_MCU_MAX78002)
+// endpoint 8,9 has FIFO of 2048 bytes
+#define EPNUM_NET_NOTIF 0x81
+#define EPNUM_NET_OUT   0x08
+#define EPNUM_NET_IN    0x89
+#else
 #define EPNUM_NET_NOTIF 0x81
 #define EPNUM_NET_OUT   0x02
 #define EPNUM_NET_IN    0x83
+#endif
 
 #else
 #define EPNUM_NET_NOTIF 0x81
