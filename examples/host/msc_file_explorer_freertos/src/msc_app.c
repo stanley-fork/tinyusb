@@ -448,12 +448,24 @@ void cli_cmd_dd(EmbeddedCli *cli, char *args, void *context) {
 
   const uint32_t start_ms = tusb_time_millis_api();
   const uint8_t  pdrv     = dev_addr - 1;
+  bool submit_failed = false;
 
   for (uint32_t i = 0; i < count; i += sectors_per_xfer) {
     const uint16_t n = (uint16_t)((count - i < sectors_per_xfer) ? (count - i) : sectors_per_xfer);
     _disk_busy[pdrv] = true;
-    tuh_msc_read10(dev_addr, lun, rw_buf, i, n, disk_io_complete, 0);
+
+    if (!tuh_msc_read10(dev_addr, lun, rw_buf, i, n, disk_io_complete, 0)) {
+      _disk_busy[pdrv] = false;
+      printf("dd: failed to submit read at sector %" PRIu32 " (%u sectors)\r\n", i, n);
+      submit_failed = true;
+      break;
+    }
+
     wait_for_disk_io(pdrv);
+  }
+
+  if (submit_failed) {
+    return;
   }
 
   const uint32_t elapsed_ms = tusb_time_millis_api() - start_ms;
@@ -552,6 +564,7 @@ void cli_cmd_cp(EmbeddedCli *cli, char *args, void *context) {
 
   if (FR_OK != f_open(f_dst, dst, FA_WRITE | FA_CREATE_ALWAYS)) {
     printf("cannot create '%s'\r\n", dst);
+    f_close(f_src);
     return;
   } else {
     UINT rd_count = 0;
@@ -627,6 +640,7 @@ void cli_cmd_pwd(EmbeddedCli *cli, char *args, void *context) {
   char path[256];
   if (FR_OK != f_getcwd(path, sizeof(path))) {
     printf("cannot get current working directory\r\n");
+    return;
   }
 
   puts(path);
