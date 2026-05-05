@@ -33,6 +33,7 @@ import re
 import sys
 import time
 import warnings
+import signal
 
 # Suppress pkg_resources deprecation warning from fs module
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
@@ -44,6 +45,7 @@ import subprocess
 import json
 import glob
 from multiprocessing import Pool
+from multiprocessing import TimeoutError as MpTimeoutError
 import fs
 import hashlib
 import ctypes
@@ -61,6 +63,17 @@ test_only = []
 board_test = {}
 build_dir = 'cmake-build'
 skip_flash = False
+
+CMD_TIMEOUT = int(os.getenv('HIL_CMD_TIMEOUT', '180'))
+POOL_TIMEOUT = int(os.getenv('HIL_POOL_TIMEOUT', '3000'))
+
+
+def cmd_stdout_text(out):
+    if out is None:
+        return ''
+    if isinstance(out, bytes):
+        return out.decode('utf-8', errors='ignore')
+    return str(out)
 
 WCH_RISCV_CONTENT = """
 adapter driver wlinke
@@ -205,21 +218,54 @@ def open_printer_dev(id, vendor_str, product_str, ifnum):
 # -------------------------------------------------------------
 # Flashing firmware
 # -------------------------------------------------------------
-def run_cmd(cmd, cwd=None):
-    r = subprocess.run(cmd, cwd=cwd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+def run_cmd(cmd, cwd=None, timeout=CMD_TIMEOUT):
+    popen_kwargs = {
+        'cwd': cwd,
+        'shell': True,
+        'stdout': subprocess.PIPE,
+        'stderr': subprocess.STDOUT,
+    }
+    if os.name != 'nt':
+        popen_kwargs['preexec_fn'] = os.setsid
+
+    p = subprocess.Popen(cmd, **popen_kwargs)
+    try:
+        out, _ = p.communicate(timeout=timeout)
+        r = subprocess.CompletedProcess(args=cmd, returncode=p.returncode, stdout=out)
+    except subprocess.TimeoutExpired as ex:
+        if os.name != 'nt':
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            p.kill()
+        out, _ = p.communicate()
+        timeout_out = ex.stdout or out or b''
+        title = f'COMMAND TIMEOUT ({timeout}s): {cmd}'
+        print()
+        if os.getenv('CI'):
+            print(f"::group::{title}")
+            print(cmd_stdout_text(timeout_out))
+            print(f"::endgroup::")
+        else:
+            print(title)
+            print(cmd_stdout_text(timeout_out))
+        return subprocess.CompletedProcess(args=cmd, returncode=124, stdout=timeout_out)
+
     if r.returncode != 0:
         title = f'COMMAND FAILED: {cmd}'
         print()
         if os.getenv('CI'):
             print(f"::group::{title}")
-            print(r.stdout.decode("utf-8"))
+            print(cmd_stdout_text(r.stdout))
             print(f"::endgroup::")
         else:
             print(title)
-            print(r.stdout.decode("utf-8"))
+            print(cmd_stdout_text(r.stdout))
     elif verbose:
         print(cmd)
-        print(r.stdout.decode("utf-8"))
+        print(cmd_stdout_text(r.stdout))
     return r
 
 
@@ -784,7 +830,7 @@ def test_device_cdc_msc_throughput(board):
 
     # Put tty in raw mode so dd sees pure binary throughput.
     rs = run_cmd(f'timeout 30 stty -F {tty} raw -echo')
-    assert rs.returncode == 0, f'stty failed: {rs.stdout.decode()}'
+    assert rs.returncode == 0, f'stty failed: {cmd_stdout_text(rs.stdout)}'
 
     # Payload aim: ~5 s per direction at FS (~830 kB/s), much less at HS.
     msc_count = 2 if is_fs else 16    # bs=1M
@@ -793,20 +839,20 @@ def test_device_cdc_msc_throughput(board):
     tmp_file = f'/tmp/cdc_msc_tp_{uid}.bin'
 
     rw = run_cmd(f'timeout 30 dd if=/dev/zero of={tty} bs=64K count={cdc_count} 2>&1')
-    assert rw.returncode == 0, f'CDC dd write failed: {rw.stdout.decode()}'
-    cdc_w = parse_speed(rw.stdout.decode())
+    assert rw.returncode == 0, f'CDC dd write failed: {cmd_stdout_text(rw.stdout)}'
+    cdc_w = parse_speed(cmd_stdout_text(rw.stdout))
 
     rr = run_cmd(f'timeout 30 dd if={tty} of=/dev/null bs=64K count={cdc_count} iflag=fullblock 2>&1')
-    assert rr.returncode == 0, f'CDC dd read failed: {rr.stdout.decode()}'
-    cdc_r = parse_speed(rr.stdout.decode())
+    assert rr.returncode == 0, f'CDC dd read failed: {cmd_stdout_text(rr.stdout)}'
+    cdc_r = parse_speed(cmd_stdout_text(rr.stdout))
 
     rmr = run_cmd(f'dd if={dev} of={tmp_file} bs=1M count={msc_count} iflag=direct 2>&1')
-    assert rmr.returncode == 0, f'MSC dd read failed: {rmr.stdout.decode()}'
-    msc_r = parse_speed(rmr.stdout.decode())
+    assert rmr.returncode == 0, f'MSC dd read failed: {cmd_stdout_text(rmr.stdout)}'
+    msc_r = parse_speed(cmd_stdout_text(rmr.stdout))
 
     rmw = run_cmd(f'dd if={tmp_file} of={dev} bs=1M count={msc_count} oflag=direct 2>&1')
-    assert rmw.returncode == 0, f'MSC dd write failed: {rmw.stdout.decode()}'
-    msc_w = parse_speed(rmw.stdout.decode())
+    assert rmw.returncode == 0, f'MSC dd write failed: {cmd_stdout_text(rmw.stdout)}'
+    msc_w = parse_speed(cmd_stdout_text(rmw.stdout))
 
     try:
         os.remove(tmp_file)
@@ -823,7 +869,7 @@ def test_device_dfu(board):
     timeout = ENUM_TIMEOUT
     while timeout > 0:
         ret = run_cmd(f'dfu-util -l')
-        stdout = ret.stdout.decode()
+        stdout = cmd_stdout_text(ret.stdout)
         if f'serial="{uid}"' in stdout and 'Found DFU: [cafe:4000]' in stdout:
             break
         time.sleep(1)
@@ -863,7 +909,7 @@ def test_device_dfu_runtime(board):
     timeout = ENUM_TIMEOUT
     while timeout > 0:
         ret = run_cmd(f'dfu-util -l')
-        stdout = ret.stdout.decode()
+        stdout = cmd_stdout_text(ret.stdout)
         if f'serial="{uid}"' in stdout and 'Found Runtime: [cafe:4000]' in stdout:
             break
         time.sleep(1)
@@ -1456,7 +1502,13 @@ def main():
         print('-' * 30)
 
     with Pool(processes=os.cpu_count()) as pool:
-        mret = pool.map(test_board, config_boards)
+        async_ret = pool.map_async(test_board, config_boards)
+        try:
+            mret = async_ret.get(timeout=POOL_TIMEOUT)
+        except MpTimeoutError:
+            pool.terminate()
+            pool.join()
+            raise RuntimeError(f'HIL worker pool timed out after {POOL_TIMEOUT}s')
         err_count = build_err + sum(e[1] for e in mret)
         # generate skip list for next re-run if failed: skip boards that fully passed,
         # and emit -bt BOARD:t1,t2 so each failed board only re-runs its own failed tests.
