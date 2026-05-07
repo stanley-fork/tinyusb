@@ -38,12 +38,7 @@ extern "C" {
 // Class Driver Configuration
 //--------------------------------------------------------------------+
 #ifndef CFG_TUH_MIDI_RX_BUFSIZE
-  // Default sized to 2x the bulk endpoint to absorb residue left in the FIFO
-  // when tuh_midi_stream_read() stops early on a cable-number transition.
-  // Sizing this equal to the endpoint packet size (the historical default)
-  // can cause the next bulk IN transfer to fail to queue silently, wedging
-  // the stream. See the drain-loop note on tuh_midi_stream_read() below.
-  #define CFG_TUH_MIDI_RX_BUFSIZE (2 * TUH_EPSIZE_BULK_MAX)
+  #define CFG_TUH_MIDI_RX_BUFSIZE TUH_EPSIZE_BULK_MAX
 #endif
 
 #ifndef CFG_TUH_MIDI_TX_BUFSIZE
