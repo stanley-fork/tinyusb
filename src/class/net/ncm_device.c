@@ -1028,7 +1028,9 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
             return true;
           }
 
-          TU_VERIFY(ncm_interface.bm_capabilities & NCM_NETWORK_CAPS_ETH_FILTER, false);
+          // Some hosts issue this request even if ETH_FILTER is not advertised,
+          // see https://bugzilla.kernel.org/show_bug.cgi?id=217290
+
           tud_network_set_packet_filter_cb(request->wValue);
           tud_control_xfer(rhport, request, NULL, 0);
         } break;
@@ -1060,7 +1062,7 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
 
             tu_memclr(&ncm_interface.ntb_input_size, sizeof(ncm_interface.ntb_input_size));
             tud_control_xfer(rhport, request, &ncm_interface.ntb_input_size, request->wLength);
-          } else if (stage == CONTROL_STAGE_ACK) {
+          } else if (stage == CONTROL_STAGE_DATA) {
             /* CDC-NCM 1.0 Table 6-4, up to NTB16 size */
             const uint32_t requested_size = ncm_interface.ntb_input_size.dwNtbInMaxSize;
             if (requested_size < 2048u || requested_size > 65535u) {
