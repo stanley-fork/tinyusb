@@ -30,6 +30,7 @@ import argparse
 import os
 import random
 import re
+import select
 import sys
 import time
 import warnings
@@ -923,18 +924,27 @@ def test_device_printer_to_cdc(board):
     ser.reset_input_buffer()
 
     # Test 1: Printer -> CDC with multiple sizes, write in random 1-64 byte chunks
+    LP_WRITE_TIMEOUT = 5.0  # seconds; firmware may stall draining the printer OUT endpoint
     for size in sizes:
         test_data = rand_ascii(size)
         ser.reset_input_buffer()
         rd = b''
         offset = 0
-        with open(lp_dev, 'wb') as lp:
+        lp_fd = os.open(lp_dev, os.O_WRONLY | os.O_NONBLOCK)
+        try:
             while offset < size:
                 chunk_size = min(random.randint(1, 64), size - offset)
-                lp.write(test_data[offset:offset + chunk_size])
-                lp.flush()
+                buf = test_data[offset:offset + chunk_size]
+                written = 0
+                while written < len(buf):
+                    _, wr, _ = select.select([], [lp_fd], [], LP_WRITE_TIMEOUT)
+                    assert wr, f'Printer write timeout after {LP_WRITE_TIMEOUT}s (firmware not draining OUT endpoint)'
+                    n = os.write(lp_fd, buf[written:])
+                    written += n
                 rd += ser.read(chunk_size)
                 offset += chunk_size
+        finally:
+            os.close(lp_fd)
         # read any remaining bytes (fullspeed devices may need extra time)
         while len(rd) < size:
             remaining = ser.read(size - len(rd))
